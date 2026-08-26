@@ -11,7 +11,21 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "cli": "node dist/cli/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "commander": "^14.0.0",
+    "mailparser": "^3.9.0",
+    "mime-types": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=24"
