@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
+import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { snippet } from "./util.js";
@@ -21,7 +21,8 @@ export class Archive {
     this.db.close();
   }
 
-  async sync(messages: MailMessage[]): Promise<SyncReport> {
+  async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
+    const excludedCategories = new Set((policy.excludedCategories ?? ["spam", "promotions"]).map(normalizeCategory));
     const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
       ...message,
       messageId: `${message.accountId}:${message.messageId}`,
@@ -29,6 +30,8 @@ export class Archive {
       providerKey: `${message.accountId}:${message.providerKey}`,
       inReplyTo: message.inReplyTo ? `${message.accountId}:${message.inReplyTo}` : undefined,
     }));
+    const excluded = normalized.filter((message) => message.categories.some((category) => excludedCategories.has(category)));
+    const included = normalized.filter((message) => !message.categories.some((category) => excludedCategories.has(category)));
     const existing = this.db.prepare("SELECT provider_key, normalized_hash FROM messages").all() as {
       provider_key: string; normalized_hash: string;
     }[];
@@ -48,13 +51,16 @@ export class Archive {
         if (oldHash !== message.normalizedHash) this.replaceMessageChunks(message);
       }
     });
-    transaction(normalized);
+    transaction(included);
+    for (const message of excluded) this.removeMessage(message);
     const chunks = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks").get() as { count: number }).count);
     const backlog = Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count);
     return {
       added, updated, deleted: 0, unchanged, touchedThreads: touched.size,
       rebuiltThreads: touched.size, chunksAdded: chunks, chunksDeleted: 0,
       embeddingBacklog: backlog, archiveRevision: this.revision(),
+      excluded: excluded.length,
+      excludedByReason: countExcluded(excluded, excludedCategories),
     };
   }
 
@@ -235,17 +241,22 @@ export class Archive {
   private upsertMessage(message: NormalizedMessage): void {
     this.db.prepare(`INSERT INTO messages
       (message_id, account_id, mailbox, provider_key, thread_id, in_reply_to, subject, from_address,
-       to_addresses, cc_addresses, date, latest_text, quoted_text, attachment_text, normalized_hash)
+       to_addresses, cc_addresses, date, latest_text, quoted_text, attachment_text, normalized_hash,
+       labels, flags, classifications)
       VALUES (@messageId, @accountId, @mailbox, @providerKey, @threadId, @inReplyTo, @subject, @from,
-       @to, @cc, @date, @latestText, @quotedText, @attachmentText, @normalizedHash)
+       @to, @cc, @date, @latestText, @quotedText, @attachmentText, @normalizedHash,
+       @labels, @flags, @classifications)
       ON CONFLICT(message_id) DO UPDATE SET account_id=excluded.account_id, mailbox=excluded.mailbox,
        provider_key=excluded.provider_key, thread_id=excluded.thread_id, in_reply_to=excluded.in_reply_to,
        subject=excluded.subject, from_address=excluded.from_address, to_addresses=excluded.to_addresses,
        cc_addresses=excluded.cc_addresses, date=excluded.date, latest_text=excluded.latest_text,
        quoted_text=excluded.quoted_text, attachment_text=excluded.attachment_text,
-       normalized_hash=excluded.normalized_hash`).run({
+       normalized_hash=excluded.normalized_hash, labels=excluded.labels, flags=excluded.flags,
+       classifications=excluded.classifications`).run({
       ...message, inReplyTo: message.inReplyTo ?? null,
       to: JSON.stringify(message.to), cc: JSON.stringify(message.cc),
+      labels: JSON.stringify(message.labels ?? []), flags: JSON.stringify(message.flags ?? []),
+      classifications: JSON.stringify(message.classifications ?? []),
       attachmentText: attachmentText(message),
     });
     this.db.prepare("DELETE FROM attachments WHERE message_id = ?").run(message.messageId);
@@ -256,6 +267,16 @@ export class Archive {
         attachment.name, attachment.mimeType, attachment.size ?? null,
         attachment.contentHash ?? null, attachment.text ?? null);
     }
+  }
+
+  private removeMessage(message: NormalizedMessage): void {
+    const stored = this.db.prepare("SELECT message_id FROM messages WHERE provider_key = ?").get(message.providerKey) as { message_id: string } | undefined;
+    if (!stored) return;
+    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = ?").all(stored.message_id) as { rowid: number }[];
+    for (const row of rows) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
+    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
+    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
+    this.db.prepare("DELETE FROM messages WHERE message_id = ?").run(stored.message_id);
   }
 
   private replaceMessageChunks(message: NormalizedMessage): void {
@@ -290,7 +311,9 @@ function migrate(db: Database.Database): void {
     provider_key TEXT NOT NULL UNIQUE, thread_id TEXT NOT NULL, in_reply_to TEXT,
     subject TEXT NOT NULL, from_address TEXT NOT NULL, to_addresses TEXT NOT NULL,
     cc_addresses TEXT NOT NULL, date TEXT NOT NULL, latest_text TEXT NOT NULL,
-    quoted_text TEXT NOT NULL, attachment_text TEXT NOT NULL DEFAULT '', normalized_hash TEXT NOT NULL
+    quoted_text TEXT NOT NULL, attachment_text TEXT NOT NULL DEFAULT '', normalized_hash TEXT NOT NULL,
+    labels TEXT NOT NULL DEFAULT '[]', flags TEXT NOT NULL DEFAULT '[]',
+    classifications TEXT NOT NULL DEFAULT '[]'
   );
   CREATE TABLE IF NOT EXISTS chunks (
     chunk_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, mailbox TEXT NOT NULL,
@@ -313,6 +336,11 @@ function migrate(db: Database.Database): void {
     subject, from_address, to_addresses, thread_subject, body_latest,
     body_quoted, forwarded_text, attachment_text
   );`);
+  const columns = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+  const existingColumns = new Set(columns.map((column) => column.name));
+  for (const column of ["labels", "flags", "classifications"]) {
+    if (!existingColumns.has(column)) db.exec(`ALTER TABLE messages ADD COLUMN ${column} TEXT NOT NULL DEFAULT '[]'`);
+  }
 }
 
 function literalFtsQuery(query: string): string {
@@ -327,6 +355,20 @@ function addFilters(clauses: string[], params: unknown[], filters: SearchFilters
   if (filters.threadId) { clauses.push("c.thread_id = ?"); params.push(filters.threadId); }
   if (filters.after) { clauses.push("m.date >= ?"); params.push(filters.after); }
   if (filters.before) { clauses.push("m.date <= ?"); params.push(filters.before); }
+}
+
+function normalizeCategory(value: string): string {
+  return value.trim().toLocaleLowerCase().replace(/^category[_-]/, "").replace(/^label[_-]/, "");
+}
+
+function countExcluded(messages: NormalizedMessage[], excluded: Set<string>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const message of messages) {
+    for (const category of message.categories) {
+      if (excluded.has(category)) counts[category] = (counts[category] ?? 0) + 1;
+    }
+  }
+  return counts;
 }
 
 type SearchRow = { chunk_id: string; message_id: string; thread_id: string; account_id: string; mailbox: string; subject: string; from_address: string; to_addresses: string; date: string; snippet: string; score: number };
@@ -348,7 +390,7 @@ function hydrate(row: SearchRow, mode: "bm25", query: string): SearchHit {
 }
 
 function messageRow(row: MessageRow): NormalizedMessage {
-  return { accountId: row.account_id as string, mailbox: row.mailbox as string, providerKey: row.provider_key as string, messageId: row.message_id as string, threadId: row.thread_id as string, inReplyTo: row.in_reply_to || undefined, subject: row.subject as string, from: row.from_address as string, to: JSON.parse(row.to_addresses as string), cc: JSON.parse(row.cc_addresses as string), date: row.date as string, text: row.latest_text as string, latestText: row.latest_text as string, quotedText: row.quoted_text as string, normalizedSubject: (row.subject as string).toLocaleLowerCase(), normalizedHash: row.normalized_hash as string };
+  return { accountId: row.account_id as string, mailbox: row.mailbox as string, providerKey: row.provider_key as string, messageId: row.message_id as string, threadId: row.thread_id as string, inReplyTo: row.in_reply_to || undefined, subject: row.subject as string, from: row.from_address as string, to: JSON.parse(row.to_addresses as string), cc: JSON.parse(row.cc_addresses as string), date: row.date as string, text: row.latest_text as string, latestText: row.latest_text as string, quotedText: row.quoted_text as string, normalizedSubject: (row.subject as string).toLocaleLowerCase(), normalizedHash: row.normalized_hash as string, labels: JSON.parse(row.labels || "[]"), flags: JSON.parse(row.flags || "[]"), classifications: JSON.parse(row.classifications || "[]"), categories: [...new Set([...JSON.parse(row.labels || "[]"), ...JSON.parse(row.flags || "[]"), ...JSON.parse(row.classifications || "[]")].map(normalizeCategory))] };
 }
 
 function chunkRow(row: ChunkRow): Chunk {
