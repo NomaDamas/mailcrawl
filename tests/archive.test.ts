@@ -51,4 +51,15 @@ describe("archive", () => {
     expect(archive.searchBm25("termination")).toHaveLength(1);
     archive.close();
   });
+
+  it("keeps unchanged chunks stable after an append to the same thread", async () => {
+    const archive = new Archive();
+    await archive.sync([message]);
+    const before = archive.searchBm25("renewal")[0].chunkId;
+    await archive.sync([{ ...message, providerKey: "provider-2", messageId: "message-2", date: "2026-08-26T11:00:00Z", text: "Please approve the renewal." }]);
+    const hits = archive.searchBm25("renewal");
+    expect(hits.map((hit) => hit.chunkId)).toContain(before);
+    expect(hits).toHaveLength(2);
+    archive.close();
+  });
 });
