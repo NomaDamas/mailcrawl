@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
 import type { SearchFilters } from "../types.js";
+import { redactDiagnostic } from "../redact.js";
 
 const program = new Command();
 program.name("mailcrawl").description("Local privacy-first email indexing CLI");
@@ -145,12 +147,16 @@ program
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(`${dataDir}/archive.sqlite`);
     try {
+      let semantic: unknown = "missing";
+      try { semantic = archive.semanticGeneration(`${dataDir}/semantic`); }
+      catch (error) { semantic = redactDiagnostic({ status: "stale", error: error instanceof Error ? error.message : String(error) }); }
       output({
         name: "mailcrawl",
         archive: `${dataDir}/archive.sqlite`,
+        archivePresent: existsSync(`${dataDir}/archive.sqlite`),
         fts: "available",
-        semantic: "available",
-        recommendation: "run sync, then index before semantic search",
+        semantic,
+        recommendation: semantic === "missing" ? "run sync, then index before semantic search" : "semantic index is committed",
       }, options.json);
     } finally { archive.close(); }
   });

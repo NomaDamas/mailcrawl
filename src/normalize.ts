@@ -5,10 +5,23 @@ import { hash, makeId, normalizeSubject } from "./util.js";
 export async function normalizeMessage(input: MailMessage): Promise<NormalizedMessage> {
   let text = input.text || "";
   let html = input.html;
+  let attachments = input.attachments;
   if (input.rawMime) {
     const parsed = await simpleParser(input.rawMime);
     text = parsed.text || "";
     html = typeof parsed.html === "string" ? parsed.html : undefined;
+    attachments = (parsed.attachments || []).map((attachment) => {
+      const mimeType = attachment.contentType || "application/octet-stream";
+      const content = attachment.content || Buffer.alloc(0);
+      const textLike = mimeType.startsWith("text/") && content.length <= 1_000_000;
+      return {
+        name: attachment.filename || "unnamed",
+        mimeType,
+        size: attachment.size ?? content.length,
+        contentHash: hash(content.toString("base64")),
+        text: textLike ? content.toString("utf8") : undefined,
+      };
+    });
   }
   const quoted = extractQuoted(text);
   const latest = text.slice(0, text.length - quoted.length).trim();
@@ -21,6 +34,7 @@ export async function normalizeMessage(input: MailMessage): Promise<NormalizedMe
     messageId,
     threadId,
     html,
+    attachments,
     normalizedSubject: normalizeSubject(subject),
     latestText: latest,
     quotedText: quoted,
