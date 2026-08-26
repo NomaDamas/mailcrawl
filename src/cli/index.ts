@@ -70,6 +70,32 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
 }
 
 program
+  .command("search")
+  .argument("<query>")
+  .option("--mode <mode>", "keyword, bm25, semantic, hybrid", "bm25")
+  .option("--account <id>")
+  .option("--mailbox <name>")
+  .option("--from <address>")
+  .option("--to <address>")
+  .option("--thread <id>")
+  .option("--after <date>")
+  .option("--before <date>")
+  .option("--limit <n>", "result limit", "10")
+  .option("--json")
+  .action(async (query: string, options: SearchOptions & { mode: string }, command: Command) => {
+    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    try {
+      const filter = filters(options);
+      const limit = Number(options.limit);
+      const result = options.mode === "bm25" ? archive.searchBm25(query, filter, limit)
+        : options.mode === "semantic" ? archive.searchSemantic(query, filter, limit)
+          : options.mode === "hybrid" ? archive.searchHybrid(query, filter, limit)
+            : (() => { throw new Error(`unsupported search mode: ${options.mode}`); })();
+      output(result, options.json);
+    } finally { archive.close(); }
+  });
+
+program
   .command("message")
   .command("get <messageId>")
   .option("--json")
@@ -106,7 +132,15 @@ program
   .action(async (options: JsonOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(`${dataDir}/archive.sqlite`);
-    try { output({ name: "mailcrawl", archive: `${dataDir}/archive.sqlite`, fts: "available" }, options.json); } finally { archive.close(); }
+    try {
+      output({
+        name: "mailcrawl",
+        archive: `${dataDir}/archive.sqlite`,
+        fts: "available",
+        semantic: "available",
+        recommendation: "run sync, then index before semantic search",
+      }, options.json);
+    } finally { archive.close(); }
   });
 
 program.parseAsync().catch((error: unknown) => {
