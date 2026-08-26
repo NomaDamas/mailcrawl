@@ -31,4 +31,26 @@ describe("MIME attachment extraction", () => {
     expect(message.attachments?.[0]).toMatchObject({ name: "notes.txt", text: "Important attachment text." });
     expect(buildChunks(message).some((chunk) => chunk.section === "attachment")).toBe(true);
   });
+
+  it("produces the same normalized hash on repeated raw MIME ingestion", async () => {
+    const rawMime = [
+      "From: a@example.com",
+      "To: b@example.com",
+      "Subject: Repeatable",
+      "Date: Wed, 26 Aug 2026 00:00:00 +0000",
+      "MIME-Version: 1.0",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "Repeatable body.",
+    ].join("\r\n");
+    const input = {
+      accountId: "a", mailbox: "INBOX", providerKey: "repeatable",
+      subject: "Repeatable", from: "a@example.com", to: ["b@example.com"], cc: [],
+      date: "2026-08-26T00:00:00Z", text: "", rawMime,
+    };
+    const first = await normalizeMessage(input);
+    const second = await normalizeMessage(input);
+    expect(second.normalizedHash).toBe(first.normalizedHash);
+    expect(second.attachments).toEqual(first.attachments);
+  });
 });
