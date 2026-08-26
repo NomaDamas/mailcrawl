@@ -32,19 +32,33 @@ export class HimalayaSource implements MailSource {
     const { stdout } = await execFileAsync("himalaya", args, { maxBuffer: 16 * 1024 * 1024 });
     const payload = JSON.parse(stdout) as { envelopes?: HimalayaEnvelope[] };
     const envelopes = payload.envelopes ?? (Array.isArray(payload) ? payload as unknown as HimalayaEnvelope[] : []);
-    return envelopes.map((envelope) => ({
-      accountId: this.account,
-      mailbox: this.mailbox,
-      providerKey: String(envelope.id ?? envelope.uid ?? envelope.message_id),
-      messageId: envelope.message_id,
-      threadId: envelope.thread_id,
-      subject: envelope.subject ?? "",
-      from: address(envelope.from),
-      to: addresses(envelope.to),
-      cc: addresses(envelope.cc),
-      date: envelope.date ?? new Date(0).toISOString(),
-      text: envelope.body ?? envelope.snippet ?? "",
+    return Promise.all(envelopes.map(async (envelope) => {
+      const providerKey = String(envelope.id ?? envelope.uid ?? envelope.message_id);
+      const rawMime = await this.read(providerKey);
+      return {
+        accountId: this.account,
+        mailbox: this.mailbox,
+        providerKey,
+        messageId: envelope.message_id,
+        threadId: envelope.thread_id,
+        subject: envelope.subject ?? "",
+        from: address(envelope.from),
+        to: addresses(envelope.to),
+        cc: addresses(envelope.cc),
+        date: envelope.date ?? new Date(0).toISOString(),
+        text: envelope.body ?? envelope.snippet ?? "",
+        rawMime,
+      };
     }));
+  }
+
+  private async read(id: string): Promise<string> {
+    const args = ["-a", this.account];
+    if (this.backend) args.push("-b", this.backend);
+    args.push("--json", "message", "read", id, "--raw");
+    const { stdout } = await execFileAsync("himalaya", args, { maxBuffer: 32 * 1024 * 1024 });
+    const payload = JSON.parse(stdout) as { message?: string };
+    return payload.message ?? stdout;
   }
 }
 
