@@ -31,6 +31,15 @@ program
     }
   });
 
+program
+  .command("index")
+  .option("--json")
+  .action(async (options: JsonOptions, command: Command) => {
+    const dataDir = command.parent!.opts().dataDir as string;
+    const archive = new Archive(`${dataDir}/archive.sqlite`);
+    try { output({ ...archive.indexSemantic(), embedder: "local-hash-v1" }, options.json); } finally { archive.close(); }
+  });
+
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
   program
     .command(`search:${mode}`)
@@ -48,8 +57,12 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
       const dataDir = command.parent!.opts().dataDir as string;
       const archive = new Archive(`${dataDir}/archive.sqlite`);
       try {
-        if (mode !== "bm25") throw new Error(`${mode} search is not implemented yet`);
-        output(archive.searchBm25(query, filters(options), Number(options.limit)), options.json);
+        const result = mode === "bm25"
+          ? archive.searchBm25(query, filters(options), Number(options.limit))
+          : mode === "hybrid"
+            ? archive.searchHybrid(query, filters(options), Number(options.limit))
+            : archive.searchSemantic(query, filters(options), Number(options.limit));
+        output(result, options.json);
       } finally {
         archive.close();
       }
@@ -63,6 +76,15 @@ program
   .action(async (messageId: string, options: JsonOptions, command: Command) => {
     const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
     try { output(archive.getMessage(messageId) ?? null, options.json); } finally { archive.close(); }
+  });
+
+program
+  .command("chunk-context")
+  .argument("<chunkId>")
+  .option("--json")
+  .action(async (chunkId: string, options: JsonOptions, command: Command) => {
+    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    try { output(archive.getChunkContext(chunkId), options.json); } finally { archive.close(); }
   });
 
 program

@@ -65,6 +65,61 @@ export class Archive {
     return (this.db.prepare(sql).all(...params) as SearchRow[]).map((row) => hydrate(row, "bm25", query));
   }
 
+  indexSemantic(): { embedded: number; reused: number; archiveRevision: string } {
+    const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
+      chunk_id: string; text: string; content_hash: string;
+    }[];
+    let embedded = 0;
+    let reused = 0;
+    const upsert = this.db.prepare(`INSERT INTO semantic_vectors
+      (chunk_id, content_hash, vector) VALUES (?, ?, ?)
+      ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, vector=excluded.vector`);
+    const transaction = this.db.transaction(() => {
+      for (const row of rows) {
+        const old = this.db.prepare("SELECT content_hash FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string } | undefined;
+        if (old?.content_hash === row.content_hash) { reused++; continue; }
+        upsert.run(row.chunk_id, row.content_hash, JSON.stringify(embed(row.text)));
+        embedded++;
+      }
+    });
+    transaction();
+    return { embedded, reused, archiveRevision: this.revision() };
+  }
+
+  searchSemantic(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
+    if (!query.trim()) throw new Error("empty query");
+    const queryVector = embed(query);
+    const clauses = ["1 = 1"];
+    const params: unknown[] = [];
+    addFilters(clauses, params, filters);
+    const rows = this.db.prepare(`SELECT v.vector, c.chunk_id, c.message_id, c.thread_id, c.account_id, c.mailbox,
+      m.subject, m.from_address, m.to_addresses, m.date, c.text
+      FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id JOIN messages m ON m.message_id = c.message_id
+      WHERE ${clauses.join(" AND ")}`).all(...params) as SemanticRow[];
+    return rows.map((row) => ({ row, score: dot(queryVector, JSON.parse(row.vector) as number[]) }))
+      .sort((a, b) => b.score - a.score || a.row.chunk_id.localeCompare(b.row.chunk_id))
+      .slice(0, limit)
+      .map(({ row, score }) => ({
+        chunkId: row.chunk_id, messageId: row.message_id, threadId: row.thread_id,
+        accountId: row.account_id, mailbox: row.mailbox, subject: row.subject,
+        from: row.from_address, to: JSON.parse(row.to_addresses), date: row.date,
+        snippet: snippet(row.text, query), score, mode: "semantic" as const,
+      }));
+  }
+
+  searchHybrid(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
+    const lexical = this.searchBm25(query, filters, limit * 2);
+    const semantic = this.searchSemantic(query, filters, limit * 2);
+    const merged = new Map<string, SearchHit>();
+    for (const [index, hit] of lexical.entries()) merged.set(hit.chunkId, { ...hit, score: 0.5 * (1 - index / Math.max(1, lexical.length)) });
+    for (const [index, hit] of semantic.entries()) {
+      const prior = merged.get(hit.chunkId);
+      const score = 0.5 * (1 - index / Math.max(1, semantic.length));
+      merged.set(hit.chunkId, prior ? { ...prior, score: prior.score + score, mode: "hybrid" } : { ...hit, score, mode: "hybrid" });
+    }
+    return [...merged.values()].sort((a, b) => b.score - a.score || a.chunkId.localeCompare(b.chunkId)).slice(0, limit);
+  }
+
   getMessage(messageId: string): NormalizedMessage | undefined {
     const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId) as MessageRow | undefined;
     return row && messageRow(row);
@@ -142,6 +197,9 @@ function migrate(db: Database.Database): void {
   CREATE TABLE IF NOT EXISTS embedding_queue (
     chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS semantic_vectors (
+    chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, vector TEXT NOT NULL
+  );
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     subject, from_address, to_addresses, thread_subject, body_latest,
     body_quoted, forwarded_text, attachment_text
@@ -163,6 +221,7 @@ function addFilters(clauses: string[], params: unknown[], filters: SearchFilters
 }
 
 type SearchRow = { chunk_id: string; message_id: string; thread_id: string; account_id: string; mailbox: string; subject: string; from_address: string; to_addresses: string; date: string; snippet: string; score: number };
+type SemanticRow = Omit<SearchRow, "snippet" | "score"> & { vector: string; text: string };
 type MessageRow = Record<string, string | null>;
 type ChunkRow = { rowid: number; chunk_id: string; account_id: string; mailbox: string; message_id: string; thread_id: string; section: string; ordinal: number; text: string; started_at: string; ended_at: string; content_hash: string };
 
@@ -176,4 +235,19 @@ function messageRow(row: MessageRow): NormalizedMessage {
 
 function chunkRow(row: ChunkRow): Chunk {
   return { chunkId: row.chunk_id, accountId: row.account_id, mailbox: row.mailbox, messageId: row.message_id, threadId: row.thread_id, section: row.section, ordinal: row.ordinal, text: row.text, startedAt: row.started_at, endedAt: row.ended_at, contentHash: row.content_hash };
+}
+
+function embed(text: string): number[] {
+  const vector = new Array<number>(128).fill(0);
+  const normalized = text.toLocaleLowerCase().normalize("NFKC");
+  for (let index = 0; index < normalized.length; index++) {
+    const code = normalized.codePointAt(index) ?? 0;
+    vector[(code + index * 31) % vector.length] += 1;
+  }
+  const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return vector.map((value) => value / magnitude);
+}
+
+function dot(left: number[], right: number[]): number {
+  return left.reduce((sum, value, index) => sum + value * (right[index] ?? 0), 0);
 }

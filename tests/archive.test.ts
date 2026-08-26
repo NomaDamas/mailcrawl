@@ -27,4 +27,21 @@ describe("archive", () => {
     expect(archive.searchBm25("renewal", { from: "other@example.com" })).toHaveLength(0);
     archive.close();
   });
+
+  it("indexes vectors incrementally and performs semantic retrieval", async () => {
+    const archive = new Archive();
+    await archive.sync([message]);
+    expect(archive.indexSemantic().embedded).toBe(1);
+    expect(archive.indexSemantic().reused).toBe(1);
+    expect(archive.searchSemantic("renewal condition")).toHaveLength(1);
+    archive.close();
+  });
+
+  it("merges lexical and semantic hits deterministically", async () => {
+    const archive = new Archive();
+    await archive.sync([message]);
+    archive.indexSemantic();
+    expect(archive.searchHybrid("renewal")).toMatchObject([{ mode: "hybrid", messageId: "message-1" }]);
+    archive.close();
+  });
 });
