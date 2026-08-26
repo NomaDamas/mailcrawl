@@ -1,0 +1,29 @@
+[
+  {
+    "accountId": "fixture",
+    "mailbox": "INBOX",
+    "providerKey": "fixture-1",
+    "messageId": "<fixture-1@example.com>",
+    "threadId": "thread-1",
+    "subject": "Contract renewal",
+    "from": "alice@example.com",
+    "to": ["bob@example.com"],
+    "cc": [],
+    "date": "2026-08-26T10:00:00Z",
+    "text": "The contract renewal condition is ready."
+  },
+  {
+    "accountId": "fixture",
+    "mailbox": "INBOX",
+    "providerKey": "fixture-2",
+    "messageId": "<fixture-2@example.com>",
+    "threadId": "thread-1",
+    "inReplyTo": "<fixture-1@example.com>",
+    "subject": "Re: Contract renewal",
+    "from": "bob@example.com",
+    "to": ["alice@example.com"],
+    "cc": [],
+    "date": "2026-08-26T11:00:00Z",
+    "text": "Approved, please send the final document."
+  }
+]

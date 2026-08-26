@@ -1,0 +1,105 @@
+#!/usr/bin/env node
+import { Command } from "commander";
+import { mkdir } from "node:fs/promises";
+import { Archive } from "../archive.js";
+import { FixtureSource, HimalayaSource } from "../source.js";
+import type { SearchFilters } from "../types.js";
+
+const program = new Command();
+program.name("mailcrawl").description("Local privacy-first email indexing CLI");
+program.option("--data-dir <path>", "archive directory", process.env.MAILCRAWL_DATA_DIR || ".mailcrawl");
+
+program
+  .command("sync")
+  .option("--source <source>", "fixture or himalaya", "himalaya")
+  .option("--fixture <path>")
+  .option("--account <name>")
+  .option("--mailbox <name>", "mailbox name", "INBOX")
+  .option("--backend <name>")
+  .option("--json")
+  .action(async (options: SyncOptions, command: Command) => {
+    const dataDir = command.parent!.opts().dataDir as string;
+    await mkdir(dataDir, { recursive: true });
+    const archive = new Archive(`${dataDir}/archive.sqlite`);
+    try {
+      const source = options.source === "fixture"
+        ? new FixtureSource(options.fixture!)
+        : new HimalayaSource(options.account!, options.mailbox, options.backend);
+      output(await archive.sync(await source.list()), options.json);
+    } finally {
+      archive.close();
+    }
+  });
+
+for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
+  program
+    .command(`search:${mode}`)
+    .argument("<query>")
+    .option("--account <id>")
+    .option("--mailbox <name>")
+    .option("--from <address>")
+    .option("--to <address>")
+    .option("--thread <id>")
+    .option("--after <date>")
+    .option("--before <date>")
+    .option("--limit <n>", "result limit", "10")
+    .option("--json")
+    .action(async (query: string, options: SearchOptions, command: Command) => {
+      const dataDir = command.parent!.opts().dataDir as string;
+      const archive = new Archive(`${dataDir}/archive.sqlite`);
+      try {
+        if (mode !== "bm25") throw new Error(`${mode} search is not implemented yet`);
+        output(archive.searchBm25(query, filters(options), Number(options.limit)), options.json);
+      } finally {
+        archive.close();
+      }
+    });
+}
+
+program
+  .command("message")
+  .command("get <messageId>")
+  .option("--json")
+  .action(async (messageId: string, options: JsonOptions, command: Command) => {
+    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    try { output(archive.getMessage(messageId) ?? null, options.json); } finally { archive.close(); }
+  });
+
+program
+  .command("thread")
+  .command("get <threadId>")
+  .option("--from <address>")
+  .option("--to <address>")
+  .option("--after <date>")
+  .option("--before <date>")
+  .option("--json")
+  .action(async (threadId: string, options: SearchOptions, command: Command) => {
+    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    try { output(archive.getThread(threadId, filters(options)), options.json); } finally { archive.close(); }
+  });
+
+program
+  .command("doctor")
+  .option("--json")
+  .action(async (options: JsonOptions, command: Command) => {
+    const dataDir = command.parent!.opts().dataDir as string;
+    const archive = new Archive(`${dataDir}/archive.sqlite`);
+    try { output({ name: "mailcrawl", archive: `${dataDir}/archive.sqlite`, fts: "available" }, options.json); } finally { archive.close(); }
+  });
+
+program.parseAsync().catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(JSON.stringify({ error: message }));
+  process.exitCode = 1;
+});
+
+interface JsonOptions { json?: boolean }
+interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string }
+interface SearchOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
+function filters(options: SearchOptions): SearchFilters {
+  return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
+}
+function output(value: unknown, json?: boolean): void {
+  if (json) console.log(JSON.stringify(value));
+  else console.log(JSON.stringify(value, null, 2));
+}
