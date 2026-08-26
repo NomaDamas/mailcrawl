@@ -138,6 +138,17 @@ export class Archive {
     return (this.db.prepare(`SELECT * FROM messages WHERE ${clauses.join(" AND ")} ORDER BY date, message_id`).all(...params) as MessageRow[]).map(messageRow);
   }
 
+  getThreadContext(threadId: string, messageId?: string): { previous: NormalizedMessage[]; current?: NormalizedMessage; next: NormalizedMessage[] } {
+    const messages = this.getThread(threadId);
+    const index = messageId ? messages.findIndex((message) => message.messageId === messageId) : 0;
+    const current = index >= 0 ? messages[index] : undefined;
+    return {
+      previous: index > 0 ? messages.slice(0, index) : [],
+      current,
+      next: index >= 0 ? messages.slice(index + 1) : messages,
+    };
+  }
+
   getChunkContext(chunkId: string): { previous?: Chunk; current?: Chunk; next?: Chunk } {
     const current = this.db.prepare("SELECT * FROM chunks WHERE chunk_id = ?").get(chunkId) as ChunkRow | undefined;
     if (!current) return {};

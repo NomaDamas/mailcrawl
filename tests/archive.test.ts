@@ -73,4 +73,18 @@ describe("archive", () => {
     expect(archive.searchBm25("renewal", { accountId: "gmail" })).toHaveLength(1);
     archive.close();
   });
+
+  it("walks earlier and later messages around a search result", async () => {
+    const archive = new Archive();
+    await archive.sync([
+      message,
+      { ...message, providerKey: "provider-2", messageId: "message-2", date: "2026-08-26T11:00:00Z", text: "Second reply" },
+      { ...message, providerKey: "provider-3", messageId: "message-3", date: "2026-08-26T12:00:00Z", text: "Final reply" },
+    ]);
+    const context = archive.getThreadContext("gmail:thread-1", "gmail:message-2");
+    expect(context.previous).toHaveLength(1);
+    expect(context.current?.text).toBe("Second reply");
+    expect(context.next).toHaveLength(1);
+    archive.close();
+  });
 });

@@ -127,6 +127,16 @@ program
   });
 
 program
+  .command("thread-context")
+  .argument("<threadId>")
+  .option("--message <messageId>")
+  .option("--json")
+  .action(async (threadId: string, options: JsonOptions & { message?: string }, command: Command) => {
+    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    try { output(archive.getThreadContext(threadId, options.message), options.json); } finally { archive.close(); }
+  });
+
+program
   .command("doctor")
   .option("--json")
   .action(async (options: JsonOptions, command: Command) => {
