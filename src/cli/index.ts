@@ -143,6 +143,18 @@ program
     } finally { archive.close(); }
   });
 
+program
+  .command("repair")
+  .option("--fts")
+  .option("--json")
+  .action(async (options: JsonOptions & { fts?: boolean }, command: Command) => {
+    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    try {
+      if (!options.fts) throw new Error("pass --fts");
+      output(archive.repairFts(), options.json);
+    } finally { archive.close(); }
+  });
+
 program.parseAsync().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   console.error(JSON.stringify({ error: message }));

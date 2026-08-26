@@ -140,6 +140,24 @@ export class Archive {
     return { previous: base && chunkRow(base), current: chunkRow(current), next: next && chunkRow(next) };
   }
 
+  repairFts(): { rows: number; status: "repaired" } {
+    const rows = this.db.prepare("SELECT rowid, chunk_id, text, message_id FROM chunks").all() as {
+      rowid: number; chunk_id: string; text: string; message_id: string;
+    }[];
+    const rebuild = this.db.transaction(() => {
+      this.db.exec("DELETE FROM chunks_fts");
+      for (const row of rows) {
+        const message = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(row.message_id) as MessageRow;
+        this.db.prepare(`INSERT INTO chunks_fts(rowid, subject, from_address, to_addresses, thread_subject,
+          body_latest, body_quoted, forwarded_text, attachment_text)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.rowid, message.subject, message.from_address,
+          message.to_addresses, message.subject, row.text, "", "", message.attachment_text || "");
+      }
+    });
+    rebuild();
+    return { rows: rows.length, status: "repaired" };
+  }
+
   private upsertMessage(message: NormalizedMessage): void {
     this.db.prepare(`INSERT INTO messages
       (message_id, account_id, mailbox, provider_key, thread_id, in_reply_to, subject, from_address,
