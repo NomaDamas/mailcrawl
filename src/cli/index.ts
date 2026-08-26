@@ -39,7 +39,7 @@ program
   .action(async (options: JsonOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(`${dataDir}/archive.sqlite`);
-    try { output({ ...archive.indexSemantic(), embedder: "local-hash-v1" }, options.json); } finally { archive.close(); }
+    try { output({ ...archive.indexSemanticGeneration(`${dataDir}/semantic`), embedder: "local-hash-v1" }, options.json); } finally { archive.close(); }
   });
 
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
@@ -165,6 +165,26 @@ program
       if (!options.fts) throw new Error("pass --fts");
       output(archive.repairFts(), options.json);
     } finally { archive.close(); }
+  });
+
+program
+  .command("attachments")
+  .command("list")
+  .option("--message <messageId>")
+  .option("--json")
+  .action(async (options: JsonOptions & { message?: string }, command: Command) => {
+    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    try { output(archive.listAttachments(options.message), options.json); } finally { archive.close(); }
+  });
+
+program
+  .command("attachments")
+  .command("list")
+  .option("--message <messageId>")
+  .option("--json")
+  .action(async (options: JsonOptions & { message?: string }, command: Command) => {
+    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    try { output(archive.listAttachments(options.message), options.json); } finally { archive.close(); }
   });
 
 program.parseAsync().catch((error: unknown) => {

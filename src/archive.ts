@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
@@ -92,6 +94,38 @@ export class Archive {
     return { embedded, reused, archiveRevision: this.revision() };
   }
 
+  indexSemanticGeneration(root: string): { generation: string; embedded: number; reused: number } {
+    const currentPath = join(root, "CURRENT");
+    const generationRoot = join(root, "generations");
+    mkdirSync(generationRoot, { recursive: true });
+    const generation = `gen-${this.revision().slice(0, 16)}-${Date.now()}`;
+    const staging = join(generationRoot, `.${generation}.staging`);
+    mkdirSync(staging);
+    try {
+      const report = this.indexSemantic();
+      const vectors = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all();
+      writeFileSync(join(staging, "manifest.json"), JSON.stringify({
+        archiveRevision: this.revision(), vectors, model: "local-hash-v1",
+      }));
+      renameSync(staging, join(generationRoot, generation));
+      const pointer = join(root, `.CURRENT.${process.pid}`);
+      writeFileSync(pointer, `${generation}\n`);
+      renameSync(pointer, currentPath);
+      return { generation, embedded: report.embedded, reused: report.reused };
+    } catch (error) {
+      rmSync(staging, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  semanticGeneration(root: string): { generation: string; archiveRevision: string; vectorCount: number } {
+    const generation = readFileSync(join(root, "CURRENT"), "utf8").trim();
+    const manifest = JSON.parse(readFileSync(join(root, "generations", generation, "manifest.json"), "utf8")) as {
+      archiveRevision: string; vectors: unknown[];
+    };
+    return { generation, archiveRevision: manifest.archiveRevision, vectorCount: manifest.vectors.length };
+  }
+
   searchSemantic(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
     if (!query.trim()) throw new Error("empty query");
     const queryVector = embed(query);
@@ -129,6 +163,29 @@ export class Archive {
   getMessage(messageId: string): NormalizedMessage | undefined {
     const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId) as MessageRow | undefined;
     return row && messageRow(row);
+  }
+
+  listAttachments(messageId?: string): Array<{
+    attachmentId: string;
+    messageId: string;
+    name: string;
+    mimeType: string;
+    size: number | null;
+    contentHash: string | null;
+    extractedText: string | null;
+  }> {
+    const rows = (messageId
+      ? this.db.prepare("SELECT * FROM attachments WHERE message_id = ? ORDER BY attachment_id").all(messageId)
+      : this.db.prepare("SELECT * FROM attachments ORDER BY message_id, attachment_id").all()) as AttachmentRow[];
+    return rows.map((row) => ({
+      attachmentId: row.attachment_id,
+      messageId: row.message_id,
+      name: row.name,
+      mimeType: row.mime_type,
+      size: row.size,
+      contentHash: row.content_hash,
+      extractedText: row.extracted_text,
+    }));
   }
 
   getThread(threadId: string, filters: SearchFilters = {}): NormalizedMessage[] {
@@ -274,6 +331,15 @@ function addFilters(clauses: string[], params: unknown[], filters: SearchFilters
 
 type SearchRow = { chunk_id: string; message_id: string; thread_id: string; account_id: string; mailbox: string; subject: string; from_address: string; to_addresses: string; date: string; snippet: string; score: number };
 type SemanticRow = Omit<SearchRow, "snippet" | "score"> & { vector: string; text: string };
+type AttachmentRow = {
+  attachment_id: string;
+  message_id: string;
+  name: string;
+  mime_type: string;
+  size: number | null;
+  content_hash: string | null;
+  extracted_text: string | null;
+};
 type MessageRow = Record<string, string | null>;
 type ChunkRow = { rowid: number; chunk_id: string; account_id: string; mailbox: string; message_id: string; thread_id: string; section: string; ordinal: number; text: string; started_at: string; ended_at: string; content_hash: string };
 
