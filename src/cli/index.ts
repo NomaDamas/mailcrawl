@@ -167,18 +167,8 @@ program
     } finally { archive.close(); }
   });
 
-program
-  .command("attachments")
-  .command("list")
-  .option("--message <messageId>")
-  .option("--json")
-  .action(async (options: JsonOptions & { message?: string }, command: Command) => {
-    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
-    try { output(archive.listAttachments(options.message), options.json); } finally { archive.close(); }
-  });
-
-program
-  .command("attachments")
+const attachments = program.command("attachments");
+attachments
   .command("list")
   .option("--message <messageId>")
   .option("--json")
