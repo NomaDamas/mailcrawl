@@ -16,6 +16,8 @@ program
   .option("--account <name>")
   .option("--mailbox <name>", "mailbox name", "INBOX")
   .option("--backend <name>")
+  .option("--page-size <n>", "envelopes per page", "1000")
+  .option("--himalaya-config <path>")
   .option("--json")
   .action(async (options: SyncOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
@@ -24,7 +26,7 @@ program
     try {
       const source = options.source === "fixture"
         ? new FixtureSource(options.fixture!)
-        : new HimalayaSource(options.account!, options.mailbox, options.backend);
+        : new HimalayaSource(options.account!, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
       output(await archive.sync(await source.list()), options.json);
     } finally {
       archive.close();
@@ -172,7 +174,7 @@ program.parseAsync().catch((error: unknown) => {
 });
 
 interface JsonOptions { json?: boolean }
-interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string }
+interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; himalayaConfig?: string }
 interface SearchOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };

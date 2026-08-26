@@ -23,24 +23,26 @@ export class HimalayaSource implements MailSource {
     private readonly account: string,
     private readonly mailbox = "INBOX",
     private readonly backend?: string,
+    private readonly pageSize = 1000,
+    private readonly config?: string,
   ) {}
 
   async list(): Promise<MailMessage[]> {
-    const args = ["-a", this.account];
+    const args = this.config ? ["-c", this.config, "-a", this.account] : ["-a", this.account];
     if (this.backend) args.push("-b", this.backend);
-    args.push("envelope", "list", "--mailbox", this.mailbox, "--page-size", "1000", "--json");
+    args.push("envelope", "list", "--mailbox", this.mailbox, "--page-size", String(this.pageSize), "--json");
     const { stdout } = await execFileAsync("himalaya", args, { maxBuffer: 16 * 1024 * 1024 });
     const payload = JSON.parse(stdout) as { envelopes?: HimalayaEnvelope[] };
     const envelopes = payload.envelopes ?? (Array.isArray(payload) ? payload as unknown as HimalayaEnvelope[] : []);
     return Promise.all(envelopes.map(async (envelope) => {
-      const providerKey = String(envelope.id ?? envelope.uid ?? envelope.message_id);
+      const providerKey = String(envelope.id ?? envelope.uid ?? envelope["message-id"]);
       const rawMime = await this.read(providerKey);
       return {
         accountId: this.account,
         mailbox: this.mailbox,
         providerKey,
-        messageId: envelope.message_id,
-        threadId: envelope.thread_id,
+        messageId: envelope["message-id"],
+        inReplyTo: envelope["in-reply-to"]?.[0],
         subject: envelope.subject ?? "",
         from: address(envelope.from),
         to: addresses(envelope.to),
@@ -53,7 +55,7 @@ export class HimalayaSource implements MailSource {
   }
 
   private async read(id: string): Promise<string> {
-    const args = ["-a", this.account];
+    const args = this.config ? ["-c", this.config, "-a", this.account] : ["-a", this.account];
     if (this.backend) args.push("-b", this.backend);
     args.push("--json", "message", "read", id, "--raw");
     const { stdout } = await execFileAsync("himalaya", args, { maxBuffer: 32 * 1024 * 1024 });
@@ -65,8 +67,8 @@ export class HimalayaSource implements MailSource {
 interface HimalayaEnvelope {
   id?: string | number;
   uid?: string | number;
-  message_id?: string;
-  thread_id?: string;
+  "message-id"?: string;
+  "in-reply-to"?: string[];
   subject?: string;
   from?: unknown;
   to?: unknown;
@@ -78,6 +80,7 @@ interface HimalayaEnvelope {
 
 function address(value: unknown): string {
   if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.length ? address(value[0]) : "";
   if (value && typeof value === "object" && "email" in value) return String(value.email);
   return "";
 }
