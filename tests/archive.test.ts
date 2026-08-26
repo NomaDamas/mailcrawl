@@ -44,4 +44,11 @@ describe("archive", () => {
     expect(archive.searchHybrid("renewal")).toMatchObject([{ mode: "hybrid", messageId: "message-1" }]);
     archive.close();
   });
+
+  it("indexes extracted attachment text with the parent message", async () => {
+    const archive = new Archive();
+    await archive.sync([{ ...message, attachments: [{ name: "terms.txt", mimeType: "text/plain", text: "termination clause" }] }]);
+    expect(archive.searchBm25("termination")).toHaveLength(1);
+    archive.close();
+  });
 });

@@ -143,17 +143,27 @@ export class Archive {
   private upsertMessage(message: NormalizedMessage): void {
     this.db.prepare(`INSERT INTO messages
       (message_id, account_id, mailbox, provider_key, thread_id, in_reply_to, subject, from_address,
-       to_addresses, cc_addresses, date, latest_text, quoted_text, normalized_hash)
+       to_addresses, cc_addresses, date, latest_text, quoted_text, attachment_text, normalized_hash)
       VALUES (@messageId, @accountId, @mailbox, @providerKey, @threadId, @inReplyTo, @subject, @from,
-       @to, @cc, @date, @latestText, @quotedText, @normalizedHash)
+       @to, @cc, @date, @latestText, @quotedText, @attachmentText, @normalizedHash)
       ON CONFLICT(message_id) DO UPDATE SET account_id=excluded.account_id, mailbox=excluded.mailbox,
        provider_key=excluded.provider_key, thread_id=excluded.thread_id, in_reply_to=excluded.in_reply_to,
        subject=excluded.subject, from_address=excluded.from_address, to_addresses=excluded.to_addresses,
        cc_addresses=excluded.cc_addresses, date=excluded.date, latest_text=excluded.latest_text,
-       quoted_text=excluded.quoted_text, normalized_hash=excluded.normalized_hash`).run({
+       quoted_text=excluded.quoted_text, attachment_text=excluded.attachment_text,
+       normalized_hash=excluded.normalized_hash`).run({
       ...message, inReplyTo: message.inReplyTo ?? null,
       to: JSON.stringify(message.to), cc: JSON.stringify(message.cc),
+      attachmentText: attachmentText(message),
     });
+    this.db.prepare("DELETE FROM attachments WHERE message_id = ?").run(message.messageId);
+    for (const [index, attachment] of (message.attachments || []).entries()) {
+      this.db.prepare(`INSERT INTO attachments
+        (attachment_id, message_id, name, mime_type, size, content_hash, extracted_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(`${message.messageId}:${index}`, message.messageId,
+        attachment.name, attachment.mimeType, attachment.size ?? null,
+        attachment.contentHash ?? null, attachment.text ?? null);
+    }
   }
 
   private replaceMessageChunks(message: NormalizedMessage): void {
@@ -167,7 +177,10 @@ export class Archive {
       this.db.prepare(`INSERT INTO chunks_fts(rowid, subject, from_address, to_addresses, thread_subject,
         body_latest, body_quoted, forwarded_text, attachment_text)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(result.lastInsertRowid, message.subject, message.from,
-        message.to.join(" "), message.normalizedSubject, message.latestText, message.quotedText, "", "");
+        message.to.join(" "), message.normalizedSubject,
+        chunk.section === "latest" ? chunk.text : "",
+        chunk.section === "quoted" ? chunk.text : "",
+        "", chunk.section === "attachment" ? chunk.text : "");
       this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)
         VALUES (?, ?, 'pending', 0) ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, state='pending'`).run(chunk.chunkId, chunk.contentHash);
     }
@@ -185,7 +198,7 @@ function migrate(db: Database.Database): void {
     provider_key TEXT NOT NULL UNIQUE, thread_id TEXT NOT NULL, in_reply_to TEXT,
     subject TEXT NOT NULL, from_address TEXT NOT NULL, to_addresses TEXT NOT NULL,
     cc_addresses TEXT NOT NULL, date TEXT NOT NULL, latest_text TEXT NOT NULL,
-    quoted_text TEXT NOT NULL, normalized_hash TEXT NOT NULL
+    quoted_text TEXT NOT NULL, attachment_text TEXT NOT NULL DEFAULT '', normalized_hash TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS chunks (
     chunk_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, mailbox TEXT NOT NULL,
@@ -199,6 +212,10 @@ function migrate(db: Database.Database): void {
   );
   CREATE TABLE IF NOT EXISTS semantic_vectors (
     chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, vector TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS attachments (
+    attachment_id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER, content_hash TEXT, extracted_text TEXT
   );
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     subject, from_address, to_addresses, thread_subject, body_latest,
@@ -235,6 +252,10 @@ function messageRow(row: MessageRow): NormalizedMessage {
 
 function chunkRow(row: ChunkRow): Chunk {
   return { chunkId: row.chunk_id, accountId: row.account_id, mailbox: row.mailbox, messageId: row.message_id, threadId: row.thread_id, section: row.section, ordinal: row.ordinal, text: row.text, startedAt: row.started_at, endedAt: row.ended_at, contentHash: row.content_hash };
+}
+
+function attachmentText(message: NormalizedMessage): string {
+  return (message.attachments || []).map((attachment) => attachment.text || "").filter(Boolean).join("\n");
 }
 
 function embed(text: string): number[] {
