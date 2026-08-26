@@ -1,0 +1,19 @@
+{
+  "name": "@nomadamas/mailcrawl",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Himalaya-backed incremental email indexing and hybrid search CLI",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "mailcrawl": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

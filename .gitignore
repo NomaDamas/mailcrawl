@@ -1,0 +1,36 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+
+# Runtime data: email archives, indexes, vectors, and credentials
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+vectors/
+data/
+.mailcrawl/
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Editors and OS files
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+test-results/
+playwright-report/
