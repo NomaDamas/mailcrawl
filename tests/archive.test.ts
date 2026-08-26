@@ -41,7 +41,7 @@ describe("archive", () => {
     const archive = new Archive();
     await archive.sync([message]);
     archive.indexSemantic();
-    expect(archive.searchHybrid("renewal")).toMatchObject([{ mode: "hybrid", messageId: "message-1" }]);
+    expect(archive.searchHybrid("renewal")).toMatchObject([{ mode: "hybrid", messageId: "gmail:message-1" }]);
     archive.close();
   });
 
@@ -60,6 +60,17 @@ describe("archive", () => {
     const hits = archive.searchBm25("renewal");
     expect(hits.map((hit) => hit.chunkId)).toContain(before);
     expect(hits).toHaveLength(2);
+    archive.close();
+  });
+
+  it("keeps identical provider ids isolated across accounts", async () => {
+    const archive = new Archive();
+    await archive.sync([
+      { ...message, accountId: "gmail" },
+      { ...message, accountId: "khu" },
+    ]);
+    expect(archive.searchBm25("renewal")).toHaveLength(2);
+    expect(archive.searchBm25("renewal", { accountId: "gmail" })).toHaveLength(1);
     archive.close();
   });
 });

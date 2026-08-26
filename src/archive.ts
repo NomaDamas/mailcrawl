@@ -20,7 +20,13 @@ export class Archive {
   }
 
   async sync(messages: MailMessage[]): Promise<SyncReport> {
-    const normalized = await Promise.all(messages.map(normalizeMessage));
+    const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
+      ...message,
+      messageId: `${message.accountId}:${message.messageId}`,
+      threadId: `${message.accountId}:${message.threadId}`,
+      providerKey: `${message.accountId}:${message.providerKey}`,
+      inReplyTo: message.inReplyTo ? `${message.accountId}:${message.inReplyTo}` : undefined,
+    }));
     const existing = this.db.prepare("SELECT provider_key, normalized_hash FROM messages").all() as {
       provider_key: string; normalized_hash: string;
     }[];
