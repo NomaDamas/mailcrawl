@@ -41,6 +41,21 @@ surface instead of opening the archive database.
 See [`docs/architecture.md`](docs/architecture.md) for the proposed design,
 data model, CLI contract, and implementation milestones.
 
+## Releasing
+
+GitHub Release `vX.Y.Z` (must match `package.json`) publishes `@nomadamas/mailcrawl` to npm with OIDC trusted publishing. No `NPM_TOKEN` is stored in GitHub.
+
+One-time setup:
+
+1. Create a GitHub Environment named `release` on this repository.
+2. On [npm trusted publishers](https://docs.npmjs.com/trusted-publishers) for `@nomadamas/mailcrawl`, add GitHub Actions:
+   - Organization: `NomaDamas`
+   - Repository: `mailcrawl`
+   - Workflow filename: `release.yml`
+   - Environment: `release`
+
+Then bump the version, push `main`, and publish a GitHub Release whose tag is `v<version>`. The workflow tests, builds, publishes with provenance, and attaches the tarball to the release.
+
 ## License
 
-Planned license: MIT. This project is not yet a production release.
+MIT. This project is not yet a production release.

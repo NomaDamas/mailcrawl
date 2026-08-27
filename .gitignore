@@ -34,3 +34,6 @@ temp/
 # Test artifacts
 test-results/
 playwright-report/
+
+# npm pack artifacts
+*.tgz

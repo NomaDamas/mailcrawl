@@ -1,12 +1,29 @@
 {
   "name": "@nomadamas/mailcrawl",
   "version": "0.1.0",
-  "private": true,
   "description": "Local Himalaya-backed incremental email indexing and hybrid search CLI",
   "license": "MIT",
   "type": "module",
   "bin": {
     "mailcrawl": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NomaDamas/mailcrawl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NomaDamas/mailcrawl/issues"
+  },
+  "homepage": "https://github.com/NomaDamas/mailcrawl#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
