@@ -13,11 +13,11 @@ describe("semantic generations", () => {
       date: "2026-08-26T00:00:00Z", text: "stable vector",
     }]);
     const root = mkdtempSync(join(tmpdir(), "mailcrawl-semantic-"));
-    const first = archive.indexSemanticGeneration(root);
+    const first = await archive.indexSemanticGeneration(root);
     expect(archive.semanticGeneration(root).generation).toBe(first.generation);
     const blocked = join(root, "blocked");
     writeFileSync(blocked, "not a directory");
-    expect(() => archive.indexSemanticGeneration(blocked)).toThrow();
+    await expect(archive.indexSemanticGeneration(blocked)).rejects.toThrow();
     expect(archive.semanticGeneration(root).generation).toBe(first.generation);
     archive.close();
   });

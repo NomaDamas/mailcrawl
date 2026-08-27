@@ -31,17 +31,32 @@ describe("archive", () => {
   it("indexes vectors incrementally and performs semantic retrieval", async () => {
     const archive = new Archive();
     await archive.sync([message]);
-    expect(archive.indexSemantic().embedded).toBe(1);
-    expect(archive.indexSemantic().reused).toBe(1);
-    expect(archive.searchSemantic("renewal condition")).toHaveLength(1);
+    expect((await archive.indexSemantic()).embedded).toBe(1);
+    expect((await archive.indexSemantic()).reused).toBe(1);
+    expect(await archive.searchSemantic("renewal condition")).toHaveLength(1);
     archive.close();
   });
 
   it("merges lexical and semantic hits deterministically", async () => {
     const archive = new Archive();
     await archive.sync([message]);
-    archive.indexSemantic();
-    expect(archive.searchHybrid("renewal")).toMatchObject([{ mode: "hybrid", messageId: "gmail:message-1" }]);
+    await archive.indexSemantic();
+    expect(await archive.searchHybrid("renewal")).toMatchObject([{ mode: "hybrid", messageId: "gmail:message-1" }]);
+    archive.close();
+  });
+
+  it("uses reciprocal rank fusion for hybrid scores", async () => {
+    const archive = new Archive();
+    await archive.sync([
+      message,
+      { ...message, providerKey: "provider-2", messageId: "message-2", text: "renewal" },
+    ]);
+    await archive.indexSemantic();
+    const hits = await archive.searchHybrid("renewal", {}, 2);
+    expect(hits).toHaveLength(2);
+    expect(hits.every((hit) => hit.mode === "hybrid")).toBe(true);
+    expect(hits[0].score).toBeGreaterThan(0);
+    expect(hits[0].score).toBeGreaterThanOrEqual(hits[1].score);
     archive.close();
   });
 
@@ -95,12 +110,12 @@ describe("archive", () => {
       { ...message, providerKey: "provider-2", messageId: "message-2", classifications: ["CATEGORY_PROMOTIONS"], text: "promotion renewal" },
       { ...message, providerKey: "provider-3", messageId: "message-3", labels: ["CLIENT_PROJECT"], text: "project renewal" },
     ]);
-    archive.indexSemantic();
+    await archive.indexSemantic();
     expect(report.excluded).toBe(2);
     expect(report.excludedByReason).toEqual({ spam: 1, promotions: 1 });
     expect(archive.getMessage("gmail:message-1")).toBeUndefined();
     expect(archive.searchBm25("renewal")).toHaveLength(1);
-    expect(archive.searchSemantic("renewal")).toHaveLength(1);
+    expect(await archive.searchSemantic("renewal")).toHaveLength(1);
     archive.close();
   });
 

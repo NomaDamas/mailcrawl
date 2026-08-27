@@ -78,6 +78,8 @@ export interface SearchHit {
   mode: SearchMode;
 }
 
+export type LexicalLanguage = "ko" | "ja" | "zh" | "ar";
+
 export interface SyncReport {
   added: number;
   updated: number;

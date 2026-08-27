@@ -45,7 +45,7 @@ program
   .action(async (options: JsonOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(`${dataDir}/archive.sqlite`);
-    try { output({ ...archive.indexSemanticGeneration(`${dataDir}/semantic`), embedder: "local-hash-v1" }, options.json); } finally { archive.close(); }
+    try { output({ ...await archive.indexSemanticGeneration(`${dataDir}/semantic`), embedder: "multilingual-e5-large" }, options.json); } finally { archive.close(); }
   });
 
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
@@ -68,8 +68,8 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
         const result = mode === "bm25"
           ? archive.searchBm25(query, filters(options), Number(options.limit))
           : mode === "hybrid"
-            ? archive.searchHybrid(query, filters(options), Number(options.limit))
-            : archive.searchSemantic(query, filters(options), Number(options.limit));
+            ? await archive.searchHybrid(query, filters(options), Number(options.limit))
+            : await archive.searchSemantic(query, filters(options), Number(options.limit));
         output(result, options.json);
       } finally {
         archive.close();
@@ -96,8 +96,8 @@ program
       const filter = filters(options);
       const limit = Number(options.limit);
       const result = options.mode === "bm25" ? archive.searchBm25(query, filter, limit)
-        : options.mode === "semantic" ? archive.searchSemantic(query, filter, limit)
-          : options.mode === "hybrid" ? archive.searchHybrid(query, filter, limit)
+        : options.mode === "semantic" ? await archive.searchSemantic(query, filter, limit)
+          : options.mode === "hybrid" ? await archive.searchHybrid(query, filter, limit)
             : (() => { throw new Error(`unsupported search mode: ${options.mode}`); })();
       output(result, options.json);
     } finally { archive.close(); }

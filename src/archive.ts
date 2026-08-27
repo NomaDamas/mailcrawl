@@ -6,9 +6,12 @@ import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, Searc
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { snippet } from "./util.js";
+import { createEmbedder, type Embedder } from "./embedding.js";
+import { languagesForText, lexicalFields, tokenizeForLanguage } from "./lexical.js";
 
 export class Archive {
   readonly db: Database.Database;
+  private embedder?: Embedder;
 
   constructor(path = ":memory:") {
     this.db = new Database(path);
@@ -66,20 +69,24 @@ export class Archive {
 
   searchBm25(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
     if (!query.trim()) throw new Error("empty query");
-    const clauses = ["chunks_fts MATCH ?"];
-    const params: unknown[] = [literalFtsQuery(query)];
-    addFilters(clauses, params, filters);
-    const sql = `SELECT c.chunk_id, c.message_id, c.thread_id, c.account_id, c.mailbox,
-      m.subject, m.from_address, m.to_addresses, m.date, snippet(chunks_fts, 0, '[', ']', '…', 32) AS snippet,
-      bm25(chunks_fts, 8.0, 5.0, 2.0, 1.0, 1.0, 1.0, 0.5) AS score
-      FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid
-      JOIN messages m ON m.message_id = c.message_id
-      WHERE ${clauses.join(" AND ")} ORDER BY score LIMIT ?`;
-    params.push(limit);
-    return (this.db.prepare(sql).all(...params) as SearchRow[]).map((row) => hydrate(row, "bm25", query));
+    const lists = [this.searchLexicalTable("chunks_fts", query, filters, limit * 2)];
+    for (const language of languagesForText(query)) {
+      lists.push(this.searchLexicalTable(`chunks_fts_${language}`, tokenizeForLanguage(language, query), filters, limit * 2));
+    }
+    const merged = new Map<string, { hit: SearchHit; score: number }>();
+    const k = 60;
+    for (const list of lists) {
+      for (const [index, hit] of list.entries()) {
+        const rank = index + 1;
+        const prior = merged.get(hit.chunkId);
+        merged.set(hit.chunkId, prior ? { hit: prior.hit, score: prior.score + 1 / (k + rank) } : { hit, score: 1 / (k + rank) });
+      }
+    }
+    return [...merged.values()].sort((a, b) => b.score - a.score || a.hit.chunkId.localeCompare(b.hit.chunkId))
+      .slice(0, limit).map(({ hit, score }) => ({ ...hit, score }));
   }
 
-  indexSemantic(): { embedded: number; reused: number; archiveRevision: string } {
+  async indexSemantic(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
     const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
       chunk_id: string; text: string; content_hash: string;
     }[];
@@ -88,19 +95,28 @@ export class Archive {
     const upsert = this.db.prepare(`INSERT INTO semantic_vectors
       (chunk_id, content_hash, vector) VALUES (?, ?, ?)
       ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, vector=excluded.vector`);
+    const embedder = await this.getEmbedder();
+    const pending: typeof rows = [];
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
         const old = this.db.prepare("SELECT content_hash FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string } | undefined;
         if (old?.content_hash === row.content_hash) { reused++; continue; }
-        upsert.run(row.chunk_id, row.content_hash, JSON.stringify(embed(row.text)));
-        embedded++;
+        pending.push(row);
       }
     });
     transaction();
+    const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
+    const write = this.db.transaction(() => {
+      for (const [index, row] of pending.entries()) {
+        upsert.run(row.chunk_id, row.content_hash, JSON.stringify(vectors[index]));
+        embedded++;
+      }
+    });
+    write();
     return { embedded, reused, archiveRevision: this.revision() };
   }
 
-  indexSemanticGeneration(root: string): { generation: string; embedded: number; reused: number } {
+  async indexSemanticGeneration(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
     const currentPath = join(root, "CURRENT");
     const generationRoot = join(root, "generations");
     mkdirSync(generationRoot, { recursive: true });
@@ -108,10 +124,10 @@ export class Archive {
     const staging = join(generationRoot, `.${generation}.staging`);
     mkdirSync(staging);
     try {
-      const report = this.indexSemantic();
+      const report = await this.indexSemantic();
       const vectors = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all();
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
-        archiveRevision: this.revision(), vectors, model: "local-hash-v1",
+        archiveRevision: this.revision(), vectors, model: "multilingual-e5-large",
       }));
       renameSync(staging, join(generationRoot, generation));
       const pointer = join(root, `.CURRENT.${process.pid}`);
@@ -132,9 +148,9 @@ export class Archive {
     return { generation, archiveRevision: manifest.archiveRevision, vectorCount: manifest.vectors.length };
   }
 
-  searchSemantic(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
+  async searchSemantic(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
     if (!query.trim()) throw new Error("empty query");
-    const queryVector = embed(query);
+    const queryVector = await (await this.getEmbedder()).embedQuery(query);
     const clauses = ["1 = 1"];
     const params: unknown[] = [];
     addFilters(clauses, params, filters);
@@ -153,17 +169,23 @@ export class Archive {
       }));
   }
 
-  searchHybrid(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
+  async searchHybrid(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
     const lexical = this.searchBm25(query, filters, limit * 2);
-    const semantic = this.searchSemantic(query, filters, limit * 2);
-    const merged = new Map<string, SearchHit>();
-    for (const [index, hit] of lexical.entries()) merged.set(hit.chunkId, { ...hit, score: 0.5 * (1 - index / Math.max(1, lexical.length)) });
+    const semantic = await this.searchSemantic(query, filters, limit * 2);
+    const merged = new Map<string, { hit: SearchHit; score: number }>();
+    const k = 60;
+    for (const [index, hit] of lexical.entries()) merged.set(hit.chunkId, { hit: { ...hit, mode: "hybrid" }, score: 1 / (k + index + 1) });
     for (const [index, hit] of semantic.entries()) {
       const prior = merged.get(hit.chunkId);
-      const score = 0.5 * (1 - index / Math.max(1, semantic.length));
-      merged.set(hit.chunkId, prior ? { ...prior, score: prior.score + score, mode: "hybrid" } : { ...hit, score, mode: "hybrid" });
+      const score = 1 / (k + index + 1);
+      merged.set(hit.chunkId, prior
+        ? { hit: { ...prior.hit, mode: "hybrid" }, score: prior.score + score }
+        : { hit: { ...hit, mode: "hybrid" }, score });
     }
-    return [...merged.values()].sort((a, b) => b.score - a.score || a.chunkId.localeCompare(b.chunkId)).slice(0, limit);
+    return [...merged.values()]
+      .sort((a, b) => b.score - a.score || a.hit.chunkId.localeCompare(b.hit.chunkId))
+      .slice(0, limit)
+      .map(({ hit, score }) => ({ ...hit, score }));
   }
 
   getMessage(messageId: string): NormalizedMessage | undefined {
@@ -226,12 +248,18 @@ export class Archive {
     }[];
     const rebuild = this.db.transaction(() => {
       this.db.exec("DELETE FROM chunks_fts");
+      for (const language of lexicalFields()) this.db.exec(`DELETE FROM chunks_fts_${language}`);
       for (const row of rows) {
         const message = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(row.message_id) as MessageRow;
         this.db.prepare(`INSERT INTO chunks_fts(rowid, subject, from_address, to_addresses, thread_subject,
           body_latest, body_quoted, forwarded_text, attachment_text)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.rowid, message.subject, message.from_address,
           message.to_addresses, message.subject, row.text, "", "", message.attachment_text || "");
+        for (const language of lexicalFields()) {
+          this.db.prepare(`INSERT INTO chunks_fts_${language}(chunk_id, text, subject, from_address, to_addresses)
+            VALUES (?, ?, ?, ?, ?)`).run(row.chunk_id, tokenizeForLanguage(language, row.text),
+            message.subject, message.from_address, message.to_addresses);
+        }
       }
     });
     rebuild();
@@ -274,6 +302,7 @@ export class Archive {
     if (!stored) return;
     const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = ?").all(stored.message_id) as { rowid: number }[];
     for (const row of rows) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
+    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(stored.message_id);
     this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
     this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
     this.db.prepare("DELETE FROM messages WHERE message_id = ?").run(stored.message_id);
@@ -282,6 +311,7 @@ export class Archive {
   private replaceMessageChunks(message: NormalizedMessage): void {
     const old = this.db.prepare("SELECT rowid, chunk_id FROM chunks WHERE message_id = ?").all(message.messageId) as { rowid: number; chunk_id: string }[];
     for (const row of old) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
+    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(message.messageId);
     this.db.prepare("DELETE FROM chunks WHERE message_id = ?").run(message.messageId);
     for (const chunk of buildChunks(message)) {
       const result = this.db.prepare(`INSERT INTO chunks
@@ -294,6 +324,11 @@ export class Archive {
         chunk.section === "latest" ? chunk.text : "",
         chunk.section === "quoted" ? chunk.text : "",
         "", chunk.section === "attachment" ? chunk.text : "");
+      for (const language of lexicalFields()) {
+        this.db.prepare(`INSERT INTO chunks_fts_${language}(chunk_id, text, subject, from_address, to_addresses)
+          VALUES (?, ?, ?, ?, ?)`).run(chunk.chunkId, tokenizeForLanguage(language, chunk.text),
+          message.subject, message.from, message.to.join(" "));
+      }
       this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)
         VALUES (?, ?, 'pending', 0) ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, state='pending'`).run(chunk.chunkId, chunk.contentHash);
     }
@@ -302,6 +337,28 @@ export class Archive {
   private revision(): string {
     const rows = this.db.prepare("SELECT chunk_id, content_hash FROM chunks ORDER BY chunk_id").all() as { chunk_id: string; content_hash: string }[];
     return createHash("sha256").update(rows.map((row) => `${row.chunk_id}\0${row.content_hash}`).join("\0")).digest("hex");
+  }
+
+  private async getEmbedder(): Promise<Embedder> {
+    this.embedder ??= await createEmbedder();
+    return this.embedder;
+  }
+
+  private searchLexicalTable(table: string, query: string, filters: SearchFilters, limit: number): SearchHit[] {
+    const clauses = [`${table} MATCH ?`];
+    const params: unknown[] = [literalFtsQuery(query)];
+    addFilters(clauses, params, filters);
+    const join = table === "chunks_fts"
+      ? `JOIN chunks c ON c.rowid = ${table}.rowid`
+      : `JOIN chunks c ON c.chunk_id = ${table}.chunk_id`;
+    const sql = `SELECT c.chunk_id, c.message_id, c.thread_id, c.account_id, c.mailbox,
+      m.subject, m.from_address, m.to_addresses, m.date,
+      bm25(${table}) AS score
+      FROM ${table} ${join}
+      JOIN messages m ON m.message_id = c.message_id
+      WHERE ${clauses.join(" AND ")} ORDER BY score LIMIT ?`;
+    params.push(limit);
+    return (this.db.prepare(sql).all(...params) as SearchRow[]).map((row) => hydrate(row, "bm25", query));
   }
 }
 
@@ -334,8 +391,16 @@ function migrate(db: Database.Database): void {
   );
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     subject, from_address, to_addresses, thread_subject, body_latest,
-    body_quoted, forwarded_text, attachment_text
+    body_quoted, forwarded_text, attachment_text,
+    tokenize = 'unicode61'
   );`);
+  for (const language of lexicalFields()) {
+    const table = `chunks_fts_${language}`;
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${table} USING fts5(
+      chunk_id UNINDEXED, text, subject, from_address, to_addresses,
+      tokenize = 'unicode61'
+    );`);
+  }
   const columns = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
   const existingColumns = new Set(columns.map((column) => column.name));
   for (const column of ["labels", "flags", "classifications"]) {
