@@ -28,7 +28,12 @@ export async function normalizeMessage(input: MailMessage): Promise<NormalizedMe
   const subject = input.subject.trim();
   const messageId = input.messageId || input.providerKey;
   const threadId = input.threadId || makeId(input.accountId, normalizeSubject(subject));
-  const normalizedHash = hash(JSON.stringify([subject, input.from, input.to, input.cc, latest, quoted]));
+  const normalizedHash = hash(JSON.stringify([subject, input.from, input.to, input.cc, latest, quoted, input.labels, input.flags, input.classifications]));
+  const categories = [...new Set([
+    ...(input.classifications || []),
+    ...(input.labels || []),
+    ...(input.flags || []),
+  ].map(normalizeCategory).filter(Boolean))];
   return {
     ...input,
     messageId,
@@ -40,7 +45,12 @@ export async function normalizeMessage(input: MailMessage): Promise<NormalizedMe
     quotedText: quoted,
     text: latest,
     normalizedHash,
+    categories,
   };
+}
+
+function normalizeCategory(value: string): string {
+  return value.trim().toLocaleLowerCase().replace(/^category[_-]/, "").replace(/^label[_-]/, "");
 }
 
 function extractQuoted(text: string): string {

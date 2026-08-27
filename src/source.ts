@@ -49,6 +49,9 @@ export class HimalayaSource implements MailSource {
         cc: addresses(envelope.cc),
         date: envelope.date ?? new Date(0).toISOString(),
         text: envelope.body ?? envelope.snippet ?? "",
+        labels: strings(envelope.labels),
+        flags: strings(envelope.flags),
+        classifications: strings(envelope.classifications),
         rawMime,
       };
     }));
@@ -76,6 +79,9 @@ interface HimalayaEnvelope {
   date?: string;
   body?: string;
   snippet?: string;
+  labels?: unknown;
+  flags?: unknown;
+  classifications?: unknown;
 }
 
 function address(value: unknown): string {
@@ -88,4 +94,8 @@ function address(value: unknown): string {
 function addresses(value: unknown): string[] {
   if (!Array.isArray(value)) return value ? [address(value)] : [];
   return value.map(address).filter(Boolean);
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
 }

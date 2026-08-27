@@ -87,4 +87,32 @@ describe("archive", () => {
     expect(context.next).toHaveLength(1);
     archive.close();
   });
+
+  it("excludes spam and promotions from every index by default", async () => {
+    const archive = new Archive();
+    const report = await archive.sync([
+      { ...message, classifications: ["CATEGORY_SPAM"], text: "secret spam renewal" },
+      { ...message, providerKey: "provider-2", messageId: "message-2", classifications: ["CATEGORY_PROMOTIONS"], text: "promotion renewal" },
+      { ...message, providerKey: "provider-3", messageId: "message-3", labels: ["CLIENT_PROJECT"], text: "project renewal" },
+    ]);
+    archive.indexSemantic();
+    expect(report.excluded).toBe(2);
+    expect(report.excludedByReason).toEqual({ spam: 1, promotions: 1 });
+    expect(archive.getMessage("gmail:message-1")).toBeUndefined();
+    expect(archive.searchBm25("renewal")).toHaveLength(1);
+    expect(archive.searchSemantic("renewal")).toHaveLength(1);
+    archive.close();
+  });
+
+  it("allows callers to disable or customize classification exclusions", async () => {
+    const archive = new Archive();
+    const report = await archive.sync([{
+      ...message, classifications: ["CATEGORY_SPAM"], labels: ["CLIENT_PROJECT"],
+    }], { excludedCategories: [] });
+    expect(report.excluded).toBe(0);
+    expect(archive.getMessage("gmail:message-1")?.categories).toContain("spam");
+    expect(archive.searchBm25("renewal")).toHaveLength(1);
+    archive.close();
+  });
+
 });

@@ -20,6 +20,8 @@ program
   .option("--backend <name>")
   .option("--page-size <n>", "envelopes per page", "1000")
   .option("--himalaya-config <path>")
+  .option("--include-category <name>", "include a normally excluded category", collect, [])
+  .option("--exclude-category <name>", "exclude a classification category", collect, [])
   .option("--json")
   .action(async (options: SyncOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
@@ -29,7 +31,9 @@ program
       const source = options.source === "fixture"
         ? new FixtureSource(options.fixture!)
         : new HimalayaSource(options.account!, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
-      output(await archive.sync(await source.list()), options.json);
+      const excludedCategories = (options.excludeCategory.length ? options.excludeCategory : ["spam", "promotions"])
+        .filter((category) => !options.includeCategory.includes(category));
+      output(await archive.sync(await source.list(), { excludedCategories }), options.json);
     } finally {
       archive.close();
     }
@@ -190,7 +194,7 @@ program.parseAsync().catch((error: unknown) => {
 });
 
 interface JsonOptions { json?: boolean }
-interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; himalayaConfig?: string }
+interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
 interface SearchOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
@@ -198,4 +202,7 @@ function filters(options: SearchOptions): SearchFilters {
 function output(value: unknown, json?: boolean): void {
   if (json) console.log(JSON.stringify(value));
   else console.log(JSON.stringify(value, null, 2));
+}
+function collect(value: string, previous: string[]): string[] {
+  return previous.concat(value.toLocaleLowerCase());
 }

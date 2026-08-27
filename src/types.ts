@@ -16,6 +16,9 @@ export interface MailMessage {
   html?: string;
   rawMime?: string;
   attachments?: AttachmentInput[];
+  labels?: string[];
+  flags?: string[];
+  classifications?: string[];
 }
 
 export interface AttachmentInput {
@@ -33,6 +36,7 @@ export interface NormalizedMessage extends MailMessage {
   latestText: string;
   quotedText: string;
   normalizedHash: string;
+  categories: string[];
 }
 
 export interface Chunk {
@@ -85,4 +89,10 @@ export interface SyncReport {
   chunksDeleted: number;
   embeddingBacklog: number;
   archiveRevision: string;
+  excluded: number;
+  excludedByReason: Record<string, number>;
+}
+
+export interface ClassificationPolicy {
+  excludedCategories?: string[];
 }
