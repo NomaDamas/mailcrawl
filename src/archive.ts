@@ -7,11 +7,12 @@ import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { snippet } from "./util.js";
 import { createEmbedder, type Embedder } from "./embedding.js";
-import { languagesForText, lexicalFields, tokenizeForLanguage } from "./lexical.js";
+import { createLexicalAnalyzers, languagesForText, lexicalFields, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
 
 export class Archive {
   readonly db: Database.Database;
   private embedder?: Embedder;
+  private lexical?: LexicalAnalyzers;
 
   constructor(path = ":memory:") {
     this.db = new Database(path);
@@ -21,6 +22,7 @@ export class Archive {
   }
 
   close(): void {
+    void this.lexical?.close();
     this.db.close();
   }
 
@@ -43,6 +45,18 @@ export class Archive {
     let updated = 0;
     let unchanged = 0;
     const touched = new Set<string>();
+    const required = [...new Set(included.flatMap((message) => languagesForText(`${message.subject} ${message.text}`)))];
+    if (required.length) this.lexical = await createLexicalAnalyzers(required);
+    const analyzedChunks = new Map<string, Map<string, string>>();
+    for (const message of included) {
+      const oldHash = previous.get(message.providerKey);
+      if (oldHash === message.normalizedHash) continue;
+      for (const chunk of buildChunks(message)) {
+        const tokens = new Map<string, string>();
+        for (const language of required) tokens.set(language, await this.lexical!.tokenize(language, chunk.text));
+        analyzedChunks.set(chunk.chunkId, tokens);
+      }
+    }
     const transaction = this.db.transaction((items: NormalizedMessage[]) => {
       for (const message of items) {
         const oldHash = previous.get(message.providerKey);
@@ -51,7 +65,7 @@ export class Archive {
         else unchanged++;
         if (oldHash !== message.normalizedHash) touched.add(message.threadId);
         this.upsertMessage(message);
-        if (oldHash !== message.normalizedHash) this.replaceMessageChunks(message);
+        if (oldHash !== message.normalizedHash) this.replaceMessageChunks(message, analyzedChunks);
       }
     });
     transaction(included);
@@ -67,11 +81,13 @@ export class Archive {
     };
   }
 
-  searchBm25(query: string, filters: SearchFilters = {}, limit = 10): SearchHit[] {
+  async searchBm25(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
     if (!query.trim()) throw new Error("empty query");
+    const languages = languagesForText(query);
+    if (languages.length) this.lexical ??= await createLexicalAnalyzers(languages);
     const lists = [this.searchLexicalTable("chunks_fts", query, filters, limit * 2)];
     for (const language of languagesForText(query)) {
-      lists.push(this.searchLexicalTable(`chunks_fts_${language}`, tokenizeForLanguage(language, query), filters, limit * 2));
+      lists.push(this.searchLexicalTable(`chunks_fts_${language}`, await this.lexical!.tokenize(language, query), filters, limit * 2));
     }
     const merged = new Map<string, { hit: SearchHit; score: number }>();
     const k = 60;
@@ -170,7 +186,7 @@ export class Archive {
   }
 
   async searchHybrid(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
-    const lexical = this.searchBm25(query, filters, limit * 2);
+    const lexical = await this.searchBm25(query, filters, limit * 2);
     const semantic = await this.searchSemantic(query, filters, limit * 2);
     const merged = new Map<string, { hit: SearchHit; score: number }>();
     const k = 60;
@@ -308,7 +324,7 @@ export class Archive {
     this.db.prepare("DELETE FROM messages WHERE message_id = ?").run(stored.message_id);
   }
 
-  private replaceMessageChunks(message: NormalizedMessage): void {
+  private replaceMessageChunks(message: NormalizedMessage, analyzedChunks?: Map<string, Map<string, string>>): void {
     const old = this.db.prepare("SELECT rowid, chunk_id FROM chunks WHERE message_id = ?").all(message.messageId) as { rowid: number; chunk_id: string }[];
     for (const row of old) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
     for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(message.messageId);
@@ -326,7 +342,7 @@ export class Archive {
         "", chunk.section === "attachment" ? chunk.text : "");
       for (const language of lexicalFields()) {
         this.db.prepare(`INSERT INTO chunks_fts_${language}(chunk_id, text, subject, from_address, to_addresses)
-          VALUES (?, ?, ?, ?, ?)`).run(chunk.chunkId, tokenizeForLanguage(language, chunk.text),
+          VALUES (?, ?, ?, ?, ?)`).run(chunk.chunkId, analyzedChunks?.get(chunk.chunkId)?.get(language) ?? tokenizeForLanguage(language, chunk.text),
           message.subject, message.from, message.to.join(" "));
       }
       this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)

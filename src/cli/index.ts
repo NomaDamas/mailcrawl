@@ -66,7 +66,7 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
       const archive = new Archive(`${dataDir}/archive.sqlite`);
       try {
         const result = mode === "bm25"
-          ? archive.searchBm25(query, filters(options), Number(options.limit))
+          ? await archive.searchBm25(query, filters(options), Number(options.limit))
           : mode === "hybrid"
             ? await archive.searchHybrid(query, filters(options), Number(options.limit))
             : await archive.searchSemantic(query, filters(options), Number(options.limit));
@@ -95,7 +95,7 @@ program
     try {
       const filter = filters(options);
       const limit = Number(options.limit);
-      const result = options.mode === "bm25" ? archive.searchBm25(query, filter, limit)
+      const result = options.mode === "bm25" ? await archive.searchBm25(query, filter, limit)
         : options.mode === "semantic" ? await archive.searchSemantic(query, filter, limit)
           : options.mode === "hybrid" ? await archive.searchHybrid(query, filter, limit)
             : (() => { throw new Error(`unsupported search mode: ${options.mode}`); })();

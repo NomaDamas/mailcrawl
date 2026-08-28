@@ -23,8 +23,8 @@ describe("archive", () => {
     const second = await archive.sync([message]);
     expect(first.added).toBe(1);
     expect(second.unchanged).toBe(1);
-    expect(archive.searchBm25("renewal", { from: "alice@example.com" })).toHaveLength(1);
-    expect(archive.searchBm25("renewal", { from: "other@example.com" })).toHaveLength(0);
+    expect(await archive.searchBm25("renewal", { from: "alice@example.com" })).toHaveLength(1);
+    expect(await archive.searchBm25("renewal", { from: "other@example.com" })).toHaveLength(0);
     archive.close();
   });
 
@@ -63,16 +63,16 @@ describe("archive", () => {
   it("indexes extracted attachment text with the parent message", async () => {
     const archive = new Archive();
     await archive.sync([{ ...message, attachments: [{ name: "terms.txt", mimeType: "text/plain", text: "termination clause" }] }]);
-    expect(archive.searchBm25("termination")).toHaveLength(1);
+    expect(await archive.searchBm25("termination")).toHaveLength(1);
     archive.close();
   });
 
   it("keeps unchanged chunks stable after an append to the same thread", async () => {
     const archive = new Archive();
     await archive.sync([message]);
-    const before = archive.searchBm25("renewal")[0].chunkId;
+    const before = (await archive.searchBm25("renewal"))[0].chunkId;
     await archive.sync([{ ...message, providerKey: "provider-2", messageId: "message-2", date: "2026-08-26T11:00:00Z", text: "Please approve the renewal." }]);
-    const hits = archive.searchBm25("renewal");
+    const hits = await archive.searchBm25("renewal");
     expect(hits.map((hit) => hit.chunkId)).toContain(before);
     expect(hits).toHaveLength(2);
     archive.close();
@@ -84,8 +84,8 @@ describe("archive", () => {
       { ...message, accountId: "gmail" },
       { ...message, accountId: "khu" },
     ]);
-    expect(archive.searchBm25("renewal")).toHaveLength(2);
-    expect(archive.searchBm25("renewal", { accountId: "gmail" })).toHaveLength(1);
+    expect(await archive.searchBm25("renewal")).toHaveLength(2);
+    expect(await archive.searchBm25("renewal", { accountId: "gmail" })).toHaveLength(1);
     archive.close();
   });
 
@@ -114,7 +114,7 @@ describe("archive", () => {
     expect(report.excluded).toBe(2);
     expect(report.excludedByReason).toEqual({ spam: 1, promotions: 1 });
     expect(archive.getMessage("gmail:message-1")).toBeUndefined();
-    expect(archive.searchBm25("renewal")).toHaveLength(1);
+    expect(await archive.searchBm25("renewal")).toHaveLength(1);
     expect(await archive.searchSemantic("renewal")).toHaveLength(1);
     archive.close();
   });
@@ -126,7 +126,7 @@ describe("archive", () => {
     }], { excludedCategories: [] });
     expect(report.excluded).toBe(0);
     expect(archive.getMessage("gmail:message-1")?.categories).toContain("spam");
-    expect(archive.searchBm25("renewal")).toHaveLength(1);
+    expect(await archive.searchBm25("renewal")).toHaveLength(1);
     archive.close();
   });
 

@@ -1,3 +1,7 @@
+import { KiwiBuilder, Match, type Kiwi } from "kiwi-nlp";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createInterface, type Interface } from "node:readline";
+import { createRequire } from "node:module";
 import type { LexicalLanguage } from "./types.js";
 
 export function lexicalFields(): LexicalLanguage[] {
@@ -13,28 +17,129 @@ export function languagesForText(text: string): LexicalLanguage[] {
   return languages;
 }
 
-export function tokenizeForLanguage(language: LexicalLanguage, text: string): string {
-  if (language === "ko") return tokenizeKorean(text);
-  if (language === "ja") return tokenizeCjk(text);
-  if (language === "zh") return tokenizeCjk(text);
+export interface LexicalAnalyzers {
+  tokenize(language: LexicalLanguage, text: string): Promise<string>;
+  close(): Promise<void>;
+}
+
+export async function createLexicalAnalyzers(required: LexicalLanguage[] = lexicalFields()): Promise<LexicalAnalyzers> {
+  if (process.env.NODE_ENV === "test" || process.env.MAILCRAWL_LEXICAL_MODE === "mock") {
+    return { tokenize: async (language, text) => tokenizeMock(language, text), close: async () => undefined };
+  }
+  return new ConfiguredAnalyzers(
+    required.includes("ko") ? await KiwiAnalyzer.create() : undefined,
+    required.includes("ja") ? await HelperAnalyzer.create("ja", process.env.MAILCRAWL_JA_HELPER, "mailcrawl-ja") : undefined,
+    required.includes("zh") ? await HelperAnalyzer.create("zh", process.env.MAILCRAWL_ZH_HELPER, "mailcrawl-zh") : undefined,
+  );
+}
+
+class ConfiguredAnalyzers implements LexicalAnalyzers {
+  constructor(
+    private readonly korean?: KiwiAnalyzer,
+    private readonly japanese?: HelperAnalyzer,
+    private readonly chinese?: HelperAnalyzer,
+  ) {}
+
+  tokenize(language: LexicalLanguage, text: string): Promise<string> {
+    if (language === "ko" && this.korean) return this.korean.tokenize(text);
+    if (language === "ja" && this.japanese) return this.japanese.tokenize(text);
+    if (language === "zh" && this.chinese) return this.chinese.tokenize(text);
+    return Promise.resolve(tokenizeArabic(text));
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([this.korean?.close(), this.japanese?.close(), this.chinese?.close()]);
+  }
+}
+
+class KiwiAnalyzer {
+  private constructor(private readonly kiwi: Kiwi) {}
+
+  static async create(): Promise<KiwiAnalyzer> {
+    const wasmPath = process.env.MAILCRAWL_KIWI_WASM
+      ?? createRequire(import.meta.url).resolve("kiwi-nlp/dist/kiwi-wasm.wasm");
+    const modelDir = process.env.MAILCRAWL_KIWI_MODEL;
+    if (!wasmPath || !modelDir) {
+      throw new Error("Korean analyzer requires MAILCRAWL_KIWI_WASM and MAILCRAWL_KIWI_MODEL");
+    }
+    const builder = await KiwiBuilder.create(wasmPath);
+    const files = ["combiningRule.txt", "default.dict", "extract.mdl", "multi.dict", "sj.knlm", "sj.morph", "skipbigram.mdl", "typo.dict"];
+    const modelFiles = Object.fromEntries(files.map((file) => [file, `${modelDir}/${file}`]));
+    return new KiwiAnalyzer(await builder.build({ modelFiles, loadDefaultDict: true, loadTypoDict: true }));
+  }
+
+  async tokenize(text: string): Promise<string> {
+    return this.kiwi.tokenize(text, Match.allWithNormalizing).map((token) => token.str).join(" ");
+  }
+
+  async close(): Promise<void> {}
+}
+
+class HelperAnalyzer {
+  private constructor(
+    private readonly language: LexicalLanguage,
+    private readonly process: ChildProcessWithoutNullStreams,
+    private readonly lines: Interface,
+  ) {}
+
+  static async create(language: "ja" | "zh", command: string | undefined, fallbackName: string): Promise<HelperAnalyzer> {
+    const resolved = command || fallbackName;
+    const process = spawn(resolved, [], { stdio: ["pipe", "pipe", "pipe"] });
+    const lines = createInterface({ input: process.stdout });
+    const analyzer = new HelperAnalyzer(language, process, lines);
+    const startup = await analyzer.readLine();
+    const response = JSON.parse(startup) as { ready?: boolean; error?: string };
+    if (response.error) throw new Error(`${fallbackName}: ${response.error}`);
+    if (!response.ready) throw new Error(`${fallbackName} did not report ready`);
+    return analyzer;
+  }
+
+  async tokenize(text: string): Promise<string> {
+    return this.request(text);
+  }
+
+  async close(): Promise<void> {
+    this.lines.close();
+    this.process.kill();
+  }
+
+  private request(text: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const onLine = (line: string) => {
+        try {
+          const response = JSON.parse(line) as { ready?: boolean; tokens?: string; error?: string };
+          this.lines.off("line", onLine);
+          if (response.error) reject(new Error(`${this.language} analyzer: ${response.error}`));
+          else resolve(response.ready ? "ready" : response.tokens ?? "");
+        } catch (error) {
+          reject(error);
+        }
+      };
+      this.lines.on("line", onLine);
+      this.process.stdin.write(`${JSON.stringify({ text })}\n`);
+    });
+  }
+
+  private readLine(): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const onLine = (line: string) => {
+        this.lines.off("line", onLine);
+        resolve(line);
+      };
+      this.lines.on("line", onLine);
+      this.process.once("error", reject);
+    });
+  }
+}
+
+function tokenizeMock(language: LexicalLanguage, text: string): string {
+  if (language === "ko") return text.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu)?.join(" ") ?? "";
+  if (language === "ja" || language === "zh") return text.normalize("NFKC").match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{L}\p{N}]+/gu)?.join(" ") ?? "";
   return tokenizeArabic(text);
 }
 
-function tokenizeKorean(text: string): string {
-  const words = text.normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-  return words.flatMap((word) => [word, ...jamoLikeSyllableTerms(word)]).join(" ");
-}
-
-function jamoLikeSyllableTerms(word: string): string[] {
-  if (![...word].some((char) => /[\uac00-\ud7a3]/u.test(char))) return [];
-  return [...word].length > 1 ? [...word].map((_, index) => [...word].slice(index, index + 2).join("")) : [];
-}
-
-function tokenizeCjk(text: string): string {
-  const terms = text.normalize("NFKC").match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{L}\p{N}]+/gu) ?? [];
-  return terms.flatMap((term) => [...term].length > 1
-    ? [term, ...[...term].map((_, index) => [...term].slice(index, index + 2).join(""))]
-    : [term]).join(" ");
+export function tokenizeForLanguage(language: LexicalLanguage, text: string): string {
+  return tokenizeMock(language, text);
 }
 
 function tokenizeArabic(text: string): string {

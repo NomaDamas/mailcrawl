@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "skills",
+    "THIRD_PARTY_NOTICES.md",
     "README.md",
     "LICENSE"
   ],
@@ -36,9 +37,9 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1",
-    "fastembed": "^2.1.0",
     "commander": "^14.0.0",
     "fastembed": "^2.1.0",
+    "kiwi-nlp": "^0.23.0",
     "mailparser": "^3.9.0",
     "mime-types": "^3.0.1"
   },

@@ -27,6 +27,14 @@ Required runtime dependencies are Node.js 24+, the package dependencies, and
 the Himalaya CLI for live synchronization. Fixture synchronization needs no
 mail account.
 
+For Korean lexical search, provide a Kiwi model directory through
+`MAILCRAWL_KIWI_MODEL`; the WASM binary is bundled by `kiwi-nlp`. For Japanese
+and Chinese lexical search, build the repository helpers
+`tools/mailcrawl-ja` and `tools/mailcrawl-zh` and set
+`MAILCRAWL_JA_HELPER` / `MAILCRAWL_ZH_HELPER`. Production multilingual search
+fails clearly when its analyzer is not configured; it never silently uses the
+test tokenizer.
+
 ## Data and credential boundaries
 
 The archive lives under `.mailcrawl` by default. Set `--data-dir` or
