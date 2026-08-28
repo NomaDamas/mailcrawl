@@ -17,6 +17,7 @@ The Kiwi package is not modified by mailcrawl.
 
 `tools/mailcrawl-ja` follows the Kagome helper design used by discrawl PR
 #180 and is built separately from the default Node package.
+Kagome does not currently provide an official Node binding.
 
 ## Kagome and IPADIC
 
@@ -31,6 +32,8 @@ The Kiwi package is not modified by mailcrawl.
 
 `tools/mailcrawl-zh` uses the same persistent helper protocol as discrawl PR
 #180 and is built separately from the default Node package.
+The GSE repository mentions `gse-bind`, but no usable npm package was available
+at integration time, so this remains a separate Go helper.
 
 ## FastEmbed
 

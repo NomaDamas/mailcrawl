@@ -26,7 +26,8 @@ sj.knlm sj.morph skipbigram.mdl typo.dict
 ```
 
 Japanese and Chinese use the real Kagome and GSE analyzers from the discrawl
-multilingual design. Build the persistent helpers:
+multilingual design. Neither analyzer currently has a usable official Node
+binding, so build the persistent Go helpers:
 
 ```bash
 (cd tools/mailcrawl-ja && go build -o ~/.local/bin/mailcrawl-ja .)

@@ -105,10 +105,12 @@ class HelperAnalyzer {
 
   private request(text: string): Promise<string> {
     return new Promise((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
       const onLine = (line: string) => {
         try {
           const response = JSON.parse(line) as { ready?: boolean; tokens?: string; error?: string };
           this.lines.off("line", onLine);
+          this.process.off("error", onError);
           if (response.error) reject(new Error(`${this.language} analyzer: ${response.error}`));
           else resolve(response.ready ? "ready" : response.tokens ?? "");
         } catch (error) {
@@ -116,6 +118,7 @@ class HelperAnalyzer {
         }
       };
       this.lines.on("line", onLine);
+      this.process.once("error", onError);
       this.process.stdin.write(`${JSON.stringify({ text })}\n`);
     });
   }
