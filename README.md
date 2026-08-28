@@ -41,6 +41,13 @@ surface instead of opening the archive database.
 See [`docs/architecture.md`](docs/architecture.md) for the proposed design,
 data model, CLI contract, and implementation milestones.
 
+## Installation
+
+For the required Node setup, Kiwi model files, Go installation, Japanese and
+Chinese helper builds, environment variables, smoke tests, and license
+requirements, follow [`docs/multilingual-installation.md`](docs/multilingual-installation.md)
+before using multilingual indexing or search.
+
 ## Releasing
 
 GitHub Release `vX.Y.Z` (must match `package.json`) publishes `@nomadamas/mailcrawl` to npm with OIDC trusted publishing. No `NPM_TOKEN` is stored in GitHub.

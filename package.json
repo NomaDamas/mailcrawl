@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "skills",
+    "docs",
     "THIRD_PARTY_NOTICES.md",
     "README.md",
     "LICENSE"

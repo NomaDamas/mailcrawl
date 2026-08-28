@@ -2,6 +2,7 @@ import { KiwiBuilder, Match, type Kiwi } from "kiwi-nlp";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
 import { createRequire } from "node:module";
+import { readFileSync, readdirSync } from "node:fs";
 import type { LexicalLanguage } from "./types.js";
 
 export function lexicalFields(): LexicalLanguage[] {
@@ -63,9 +64,13 @@ class KiwiAnalyzer {
       throw new Error("Korean analyzer requires MAILCRAWL_KIWI_WASM and MAILCRAWL_KIWI_MODEL");
     }
     const builder = await KiwiBuilder.create(wasmPath);
-    const files = ["combiningRule.txt", "default.dict", "extract.mdl", "multi.dict", "sj.knlm", "sj.morph", "skipbigram.mdl", "typo.dict"];
-    const modelFiles = Object.fromEntries(files.map((file) => [file, `${modelDir}/${file}`]));
-    return new KiwiAnalyzer(await builder.build({ modelFiles, loadDefaultDict: true, loadTypoDict: true }));
+    const modelFiles = Object.fromEntries(
+      readdirSync(modelDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => [entry.name, readFileSync(`${modelDir}/${entry.name}`)]),
+    );
+    if (!Object.keys(modelFiles).length) throw new Error(`Korean Kiwi model directory is empty: ${modelDir}`);
+    return new KiwiAnalyzer(await builder.build({ modelFiles, modelType: "cong", loadDefaultDict: true, loadTypoDict: true }));
   }
 
   async tokenize(text: string): Promise<string> {
