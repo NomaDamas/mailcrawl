@@ -20,10 +20,12 @@ Production Korean indexing uses the real `kiwi-nlp` WASM binding. The binary
 defaults to the installed package. Set `MAILCRAWL_KIWI_MODEL` to a matching
 Kiwi model directory containing:
 
-```text
-combiningRule.txt default.dict extract.mdl multi.dict
-sj.knlm sj.morph skipbigram.mdl typo.dict
-```
+For current Kiwi releases, use the complete model variant directory described
+in `docs/multilingual-installation.md`; do not mix model and WASM versions.
+
+Semantic indexing uses the local `EmbeddingGemma` ONNX model through
+Transformers.js and ONNX Runtime. The model is downloaded to the local cache
+on first use.
 
 Japanese and Chinese use the real Kagome and GSE analyzers from the discrawl
 multilingual design. Neither analyzer currently has a usable official Node

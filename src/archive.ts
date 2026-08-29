@@ -6,19 +6,28 @@ import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, Searc
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { snippet } from "./util.js";
-import { createEmbedder, type Embedder } from "./embedding.js";
-import { createLexicalAnalyzers, languagesForText, lexicalFields, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
+import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.js";
+import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
 
 export class Archive {
   readonly db: Database.Database;
   private embedder?: Embedder;
   private lexical?: LexicalAnalyzers;
+  private lexicalRebuildRequired: boolean;
 
   constructor(path = ":memory:") {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     migrate(this.db);
+    this.lexicalRebuildRequired = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() === undefined;
+    if (!this.lexicalRebuildRequired) {
+      const row = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() as { version: string };
+      this.lexicalRebuildRequired = row.version !== LEXICAL_ANALYZER_VERSION;
+    }
+    if (this.lexicalRebuildRequired) {
+      for (const language of lexicalFields()) this.db.exec(`DELETE FROM chunks_fts_${language}`);
+    }
   }
 
   close(): void {
@@ -45,15 +54,20 @@ export class Archive {
     let updated = 0;
     let unchanged = 0;
     const touched = new Set<string>();
+    const rebuildLexical = this.lexicalRebuildRequired;
     const required = [...new Set(included.flatMap((message) => languagesForText(`${message.subject} ${message.text}`)))];
     if (required.length) this.lexical = await createLexicalAnalyzers(required);
     const analyzedChunks = new Map<string, Map<string, string>>();
     for (const message of included) {
       const oldHash = previous.get(message.providerKey);
-      if (oldHash === message.normalizedHash) continue;
+      if (!this.lexicalRebuildRequired && oldHash === message.normalizedHash) continue;
       for (const chunk of buildChunks(message)) {
         const tokens = new Map<string, string>();
-        for (const language of required) tokens.set(language, await this.lexical!.tokenize(language, chunk.text));
+        for (const language of lexicalFields()) {
+          tokens.set(language, languagesForText(chunk.text).includes(language)
+            ? await this.lexical!.tokenize(language, chunk.text)
+            : "");
+        }
         analyzedChunks.set(chunk.chunkId, tokens);
       }
     }
@@ -65,10 +79,14 @@ export class Archive {
         else unchanged++;
         if (oldHash !== message.normalizedHash) touched.add(message.threadId);
         this.upsertMessage(message);
-        if (oldHash !== message.normalizedHash) this.replaceMessageChunks(message, analyzedChunks);
+        if (rebuildLexical || oldHash !== message.normalizedHash) this.replaceMessageChunks(message, analyzedChunks);
       }
     });
     transaction(included);
+    this.db.prepare(`INSERT INTO lexical_index_meta(id, version, rebuilt_at)
+      VALUES (1, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(id) DO UPDATE SET version=excluded.version, rebuilt_at=excluded.rebuilt_at`).run(LEXICAL_ANALYZER_VERSION);
+    this.lexicalRebuildRequired = false;
     for (const message of excluded) this.removeMessage(message);
     const chunks = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks").get() as { count: number }).count);
     const backlog = Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count);
@@ -83,6 +101,9 @@ export class Archive {
 
   async searchBm25(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
     if (!query.trim()) throw new Error("empty query");
+    if (this.lexicalRebuildRequired && languagesForText(query).length) {
+      throw new Error("lexical indexes are stale; run sync before multilingual search");
+    }
     const languages = languagesForText(query);
     if (languages.length) this.lexical ??= await createLexicalAnalyzers(languages);
     const lists = [this.searchLexicalTable("chunks_fts", query, filters, limit * 2)];
@@ -109,14 +130,14 @@ export class Archive {
     let embedded = 0;
     let reused = 0;
     const upsert = this.db.prepare(`INSERT INTO semantic_vectors
-      (chunk_id, content_hash, vector) VALUES (?, ?, ?)
-      ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, vector=excluded.vector`);
+      (chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)
+      ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, model=excluded.model, vector=excluded.vector`);
     const embedder = await this.getEmbedder();
     const pending: typeof rows = [];
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
-        const old = this.db.prepare("SELECT content_hash FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string } | undefined;
-        if (old?.content_hash === row.content_hash) { reused++; continue; }
+        const old = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string; model: string } | undefined;
+        if (old?.content_hash === row.content_hash && old.model === embeddingModelName()) { reused++; continue; }
         pending.push(row);
       }
     });
@@ -124,7 +145,7 @@ export class Archive {
     const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
-        upsert.run(row.chunk_id, row.content_hash, JSON.stringify(vectors[index]));
+        upsert.run(row.chunk_id, row.content_hash, embeddingModelName(), JSON.stringify(vectors[index]));
         embedded++;
       }
     });
@@ -143,7 +164,7 @@ export class Archive {
       const report = await this.indexSemantic();
       const vectors = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all();
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
-        archiveRevision: this.revision(), vectors, model: "multilingual-e5-large",
+        archiveRevision: this.revision(), vectors, model: embeddingModelName(),
       }));
       renameSync(staging, join(generationRoot, generation));
       const pointer = join(root, `.CURRENT.${process.pid}`);
@@ -264,21 +285,18 @@ export class Archive {
     }[];
     const rebuild = this.db.transaction(() => {
       this.db.exec("DELETE FROM chunks_fts");
-      for (const language of lexicalFields()) this.db.exec(`DELETE FROM chunks_fts_${language}`);
+    for (const language of lexicalFields()) this.db.exec(`DELETE FROM chunks_fts_${language}`);
       for (const row of rows) {
         const message = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(row.message_id) as MessageRow;
         this.db.prepare(`INSERT INTO chunks_fts(rowid, subject, from_address, to_addresses, thread_subject,
           body_latest, body_quoted, forwarded_text, attachment_text)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.rowid, message.subject, message.from_address,
           message.to_addresses, message.subject, row.text, "", "", message.attachment_text || "");
-        for (const language of lexicalFields()) {
-          this.db.prepare(`INSERT INTO chunks_fts_${language}(chunk_id, text, subject, from_address, to_addresses)
-            VALUES (?, ?, ?, ?, ?)`).run(row.chunk_id, tokenizeForLanguage(language, row.text),
-            message.subject, message.from_address, message.to_addresses);
-        }
       }
     });
     rebuild();
+    this.db.prepare("DELETE FROM lexical_index_meta WHERE id = 1").run();
+    this.lexicalRebuildRequired = true;
     return { rows: rows.length, status: "repaired" };
   }
 
@@ -342,7 +360,7 @@ export class Archive {
         "", chunk.section === "attachment" ? chunk.text : "");
       for (const language of lexicalFields()) {
         this.db.prepare(`INSERT INTO chunks_fts_${language}(chunk_id, text, subject, from_address, to_addresses)
-          VALUES (?, ?, ?, ?, ?)`).run(chunk.chunkId, analyzedChunks?.get(chunk.chunkId)?.get(language) ?? tokenizeForLanguage(language, chunk.text),
+          VALUES (?, ?, ?, ?, ?)`).run(chunk.chunkId, analyzedChunks?.get(chunk.chunkId)?.get(language) ?? "",
           message.subject, message.from, message.to.join(" "));
       }
       this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)
@@ -399,17 +417,22 @@ function migrate(db: Database.Database): void {
     chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS semantic_vectors (
-    chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, vector TEXT NOT NULL
+    chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', vector TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS attachments (
     attachment_id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
     name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER, content_hash TEXT, extracted_text TEXT
+  );
+  CREATE TABLE IF NOT EXISTS lexical_index_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1), version TEXT NOT NULL, rebuilt_at TEXT NOT NULL
   );
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     subject, from_address, to_addresses, thread_subject, body_latest,
     body_quoted, forwarded_text, attachment_text,
     tokenize = 'unicode61'
   );`);
+  const vectorColumns = db.prepare("PRAGMA table_info(semantic_vectors)").all() as Array<{ name: string }>;
+  if (!vectorColumns.some((column) => column.name === "model")) db.exec("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT ''");
   for (const language of lexicalFields()) {
     const table = `chunks_fts_${language}`;
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${table} USING fts5(

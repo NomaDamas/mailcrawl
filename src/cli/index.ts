@@ -45,7 +45,7 @@ program
   .action(async (options: JsonOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(`${dataDir}/archive.sqlite`);
-    try { output({ ...await archive.indexSemanticGeneration(`${dataDir}/semantic`), embedder: "multilingual-e5-large" }, options.json); } finally { archive.close(); }
+    try { output({ ...await archive.indexSemanticGeneration(`${dataDir}/semantic`), embedder: "onnx-community/embeddinggemma-300m-ONNX" }, options.json); } finally { archive.close(); }
   });
 
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {

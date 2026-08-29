@@ -7,6 +7,10 @@ GSE project does not currently publish a usable `gse-bind` npm package. English
 uses SQLite's built-in Unicode tokenizer, and Arabic uses mailcrawl's
 in-process light stemmer.
 
+Semantic search uses Google's EmbeddingGemma through Transformers.js and ONNX
+Runtime on the local machine. The model is downloaded to the local
+Transformers cache on first use and is not a hosted service.
+
 ## 1. Install Node.js dependencies
 
 Use Node.js 24 or newer:
@@ -138,7 +142,23 @@ mailcrawl search --mode bm25 --json "契約 更新"
 mailcrawl search --mode bm25 --json "合同 更新"
 mailcrawl search --mode bm25 --json "كتاب"
 mailcrawl search --mode bm25 --json "contract renewal"
+mailcrawl index --json
+mailcrawl search --mode semantic --json "contract renewal"
 ```
+
+## 8. Lexical rebuild policy
+
+Language-specific FTS fields are derived artifacts. Their version fingerprint
+includes the Kiwi, Kagome, GSE, and Arabic analyzer versions. On a fingerprint
+change, mailcrawl clears those fields and marks them stale. The next complete
+`mailcrawl sync` re-analyzes changed and existing messages from the source and
+commits the new fingerprint atomically. Multilingual search fails clearly until
+that sync completes; the default Unicode FTS remains independent.
+
+Semantic vectors are separate derived artifacts. Changing the embedding model
+or its preprocessing requires a new semantic generation; run `mailcrawl index`
+after synchronization. Existing lexical fields remain valid when only the
+embedding model changes.
 
 ## Packaging and licenses
 
@@ -147,3 +167,10 @@ LGPL-2.1-or-later components. Kagome is MIT-licensed, its IPADIC dictionary
 has separate IPADIC/ICOT terms, and GSE is Apache-2.0. See
 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) before redistributing
 the application or helper binaries.
+
+## 9. Semantic model
+
+Semantic indexing uses `onnx-community/embeddinggemma-300m-ONNX` with
+Transformers.js and ONNX Runtime on CPU. The first `mailcrawl index` downloads
+the model to the local Transformers cache; later runs reuse that cache. The
+model is not sent to a remote embedding service.

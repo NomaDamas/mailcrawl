@@ -1,29 +1,36 @@
-import { EmbeddingModel, FlagEmbedding } from "fastembed";
+import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
 
 export interface Embedder {
   embedDocuments(texts: string[]): Promise<number[][]>;
   embedQuery(query: string): Promise<number[]>;
 }
 
-class FastEmbedder implements Embedder {
-  private constructor(private readonly model: FlagEmbedding) {}
+const EMBEDDING_MODEL = "onnx-community/embeddinggemma-300m-ONNX";
+const QUERY_PREFIX = "task: search result | query: ";
+const DOCUMENT_PREFIX = "title: none | text: ";
 
-  static async create(): Promise<FastEmbedder> {
-    const model = await FlagEmbedding.init({
-      model: EmbeddingModel.MLE5Large,
-      showDownloadProgress: false,
+class EmbeddingGemma implements Embedder {
+  private constructor(private readonly model: FeatureExtractionPipeline) {}
+
+  static async create(): Promise<EmbeddingGemma> {
+    const model = await pipeline("feature-extraction", EMBEDDING_MODEL, {
+      dtype: "q8",
+      device: "cpu",
     });
-    return new FastEmbedder(model);
+    return new EmbeddingGemma(model);
   }
 
   async embedDocuments(texts: string[]): Promise<number[][]> {
-    const result: number[][] = [];
-    for await (const batch of this.model.passageEmbed(texts, 32)) result.push(...batch);
-    return result;
+    return this.embed(texts.map((text) => DOCUMENT_PREFIX + text));
   }
 
-  embedQuery(query: string): Promise<number[]> {
-    return this.model.queryEmbed(query.trim());
+  async embedQuery(query: string): Promise<number[]> {
+    return (await this.embed([QUERY_PREFIX + query.trim()]))[0];
+  }
+
+  private async embed(texts: string[]): Promise<number[][]> {
+    const output = await this.model(texts, { pooling: "mean", normalize: true });
+    return output.tolist() as number[][];
   }
 }
 
@@ -38,7 +45,11 @@ class TestEmbedder implements Embedder {
 
 export async function createEmbedder(): Promise<Embedder> {
   if (process.env.MAILCRAWL_EMBEDDER === "mock" || process.env.NODE_ENV === "test") return new TestEmbedder();
-  return FastEmbedder.create();
+  return EmbeddingGemma.create();
+}
+
+export function embeddingModelName(): string {
+  return EMBEDDING_MODEL;
 }
 
 function hashVector(text: string): number[] {

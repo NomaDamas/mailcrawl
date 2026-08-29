@@ -136,8 +136,13 @@ content_hash
 created_at
 ```
 
-Changing the embedding model creates a separate table/collection. A failed
+Changing the embedding model creates a new semantic generation. A failed
 embedding job must not make FTS unavailable.
+
+The default implementation uses Google's `EmbeddingGemma` ONNX model through
+Transformers.js and local ONNX Runtime CPU inference. Query and document
+prefixes follow the model's retrieval instructions. Model identity is written
+to semantic generation manifests, so changing it requires a new generation.
 
 ### Hybrid
 

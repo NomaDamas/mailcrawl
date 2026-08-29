@@ -5,6 +5,8 @@ import { createRequire } from "node:module";
 import { readFileSync, readdirSync } from "node:fs";
 import type { LexicalLanguage } from "./types.js";
 
+export const LEXICAL_ANALYZER_VERSION = "kiwi-nlp@0.23.x+kagome-ipa-search+gse-search+arabic-light-v1";
+
 export function lexicalFields(): LexicalLanguage[] {
   return ["ko", "ja", "zh", "ar"];
 }

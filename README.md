@@ -7,8 +7,8 @@ account as its mail transport, then maintains a local normalized archive with
 incremental synchronization, email-aware chunking, full-text search (FTS5),
 semantic vector search, and hybrid retrieval.
 
-> Status: concept scaffold. The architecture is documented before the first
-> implementation increment.
+> Status: first functional release candidate. Use the installation guide for
+> multilingual analyzer setup before indexing production mail.
 
 ## Product goal
 
@@ -26,20 +26,28 @@ The CLI owns email synchronization and indexes. Consumers such as AutoRAG,
 OpenClaw, MCP servers, Raycast, and custom scripts consume its stable JSON
 surface instead of opening the archive database.
 
-## Planned capabilities
+## Capabilities
 
 - Himalaya-backed IMAP/JMAP/Gmail/Microsoft Graph/Maildir access
 - Stable account/mailbox/message identity and cursor state
 - MIME normalization, HTML-to-text conversion, and quoted-reply handling
 - Email-aware, thread-aware chunking
 - Incremental archive, FTS5, and embedding updates
-- LanceDB vector storage with configurable local embedding providers
+- Local EmbeddingGemma vector storage with Transformers.js and ONNX Runtime
 - FTS, semantic, and hybrid search modes
 - JSON output, bounded diagnostics, `status`, `doctor`, and `repair`
 - No credential values in logs, diagnostics, or indexed metadata by default
 
-See [`docs/architecture.md`](docs/architecture.md) for the proposed design,
-data model, CLI contract, and implementation milestones.
+See [`docs/architecture.md`](docs/architecture.md) for the data model and CLI
+contract. Lexical analyzer changes invalidate language-specific FTS fields;
+run `mailcrawl sync` to rebuild them before multilingual search. Semantic model
+changes require `mailcrawl index` to create a new vector generation.
+
+When a lexical analyzer or its model changes, the stored analyzer fingerprint
+invalidates all language-specific FTS fields. Run a complete `mailcrawl sync`
+before multilingual search; the command re-analyzes existing messages and
+atomically records the new fingerprint. Embedding model changes are independent
+and require a new `mailcrawl index` generation.
 
 ## Installation
 
@@ -61,8 +69,12 @@ One-time setup:
    - Workflow filename: `release.yml`
    - Environment: `release`
 
-Then bump the version, push `main`, and publish a GitHub Release whose tag is `v<version>`. The workflow tests, builds, publishes with provenance, and attaches the tarball to the release.
+Then bump the version, push `main`, and publish a GitHub Release whose tag is
+`v<version>`. The workflow tests, builds, publishes with provenance, and
+attaches the tarball to the release. The npm Trusted Publisher entry must
+match the repository, workflow filename, and `release` environment exactly.
 
 ## License
 
-MIT. This project is not yet a production release.
+MIT. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for runtime
+component licenses.

@@ -35,10 +35,16 @@ Kagome does not currently provide an official Node binding.
 The GSE repository mentions `gse-bind`, but no usable npm package was available
 at integration time, so this remains a separate Go helper.
 
-## FastEmbed
+## EmbeddingGemma
 
-- Source: https://github.com/Anush008/fastembed-js
-- License: MIT
+- Model: https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX
+- Base model: Google EmbeddingGemma
+- Terms: https://ai.google.dev/gemma/terms
 
-Downloaded embedding models have their own model-card licenses and are not
-redistributed by mailcrawl.
+The model is downloaded and executed locally through Transformers.js and ONNX
+Runtime. Model weights are not redistributed in the mailcrawl package.
+
+## Transformers.js
+
+- Source: https://github.com/huggingface/transformers.js
+- License: Apache-2.0
