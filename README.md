@@ -70,9 +70,9 @@ One-time setup:
    - Environment: `release`
 
 Then bump the version, push `main`, and publish a GitHub Release whose tag is
-`v<version>`. The workflow tests, builds, publishes with provenance, and
-attaches the tarball to the release. The npm Trusted Publisher entry must
-match the repository, workflow filename, and `release` environment exactly.
+`v<version>`. The workflow tests, builds, publishes with OIDC, and attaches the
+tarball to the release. Public npm provenance is unavailable while this source
+repository remains private.
 
 ## License
 

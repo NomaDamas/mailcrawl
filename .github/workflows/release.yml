@@ -74,15 +74,15 @@ jobs:
       - name: Pack
         run: npm pack
 
-      - name: Publish to npm with OIDC provenance
+      - name: Publish to npm with OIDC
         shell: bash
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
           if [[ "$version" == *-* ]]; then
-            npm publish --provenance --access public --tag next
+            npm publish --access public --tag next
           else
-            npm publish --provenance --access public
+            npm publish --access public
           fi
 
       - name: Attach package tarball to GitHub Release
