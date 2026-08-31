@@ -13,6 +13,7 @@ export class Archive {
   readonly db: Database.Database;
   private embedder?: Embedder;
   private lexical?: LexicalAnalyzers;
+  private operationTail: Promise<void> = Promise.resolve();
   private lexicalRebuildRequired: boolean;
 
   constructor(path = ":memory:") {
@@ -36,6 +37,10 @@ export class Archive {
   }
 
   async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
+    return this.runExclusive(() => this.syncUnlocked(messages, policy));
+  }
+
+  private async syncUnlocked(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
     const excludedCategories = new Set((policy.excludedCategories ?? ["spam", "promotions"]).map(normalizeCategory));
     const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
       ...message,
@@ -124,6 +129,10 @@ export class Archive {
   }
 
   async indexSemantic(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
+    return this.runExclusive(() => this.indexSemanticUnlocked());
+  }
+
+  private async indexSemanticUnlocked(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
     const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
       chunk_id: string; text: string; content_hash: string;
     }[];
@@ -157,6 +166,10 @@ export class Archive {
   }
 
   async indexSemanticGeneration(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
+    return this.runExclusive(() => this.indexSemanticGenerationUnlocked(root));
+  }
+
+  private async indexSemanticGenerationUnlocked(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
     const currentPath = join(root, "CURRENT");
     const generationRoot = join(root, "generations");
     mkdirSync(generationRoot, { recursive: true });
@@ -164,7 +177,7 @@ export class Archive {
     const staging = join(generationRoot, `.${generation}.staging`);
     mkdirSync(staging);
     try {
-      const report = await this.indexSemantic();
+      const report = await this.indexSemanticUnlocked();
       const vectors = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all();
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
         archiveRevision: this.revision(), vectors, model: embeddingModelName(),
@@ -349,6 +362,7 @@ export class Archive {
     const old = this.db.prepare("SELECT rowid, chunk_id FROM chunks WHERE message_id = ?").all(message.messageId) as { rowid: number; chunk_id: string }[];
     for (const row of old) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
     for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(message.messageId);
+    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
     this.db.prepare("DELETE FROM chunks WHERE message_id = ?").run(message.messageId);
     for (const chunk of buildChunks(message)) {
       const result = this.db.prepare(`INSERT INTO chunks
@@ -374,6 +388,19 @@ export class Archive {
   private revision(): string {
     const rows = this.db.prepare("SELECT chunk_id, content_hash FROM chunks ORDER BY chunk_id").all() as { chunk_id: string; content_hash: string }[];
     return createHash("sha256").update(rows.map((row) => `${row.chunk_id}\0${row.content_hash}`).join("\0")).digest("hex");
+  }
+
+  private async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.operationTail;
+    let release = (): void => {};
+    const turn = new Promise<void>((resolve) => { release = resolve; });
+    this.operationTail = previous.then(() => turn);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private async getEmbedder(): Promise<Embedder> {
