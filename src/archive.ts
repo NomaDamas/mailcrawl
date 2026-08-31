@@ -142,6 +142,7 @@ export class Archive {
       }
     });
     transaction();
+    if (!pending.length) return { embedded, reused, archiveRevision: this.revision() };
     const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
