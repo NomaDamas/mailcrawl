@@ -20,6 +20,7 @@ export class Archive {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     migrate(this.db);
+    cleanupOrphanedSemanticRows(this.db);
     this.lexicalRebuildRequired = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() === undefined;
     if (!this.lexicalRebuildRequired) {
       const row = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() as { version: string };
@@ -165,7 +166,9 @@ export class Archive {
     mkdirSync(staging);
     try {
       const report = await this.indexSemantic();
-      const vectors = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all();
+      const vectors = this.db.prepare(`SELECT v.chunk_id, v.content_hash, v.vector
+        FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id
+        ORDER BY v.chunk_id`).all();
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
         archiveRevision: this.revision(), vectors, model: embeddingModelName(),
       }));
@@ -349,6 +352,8 @@ export class Archive {
     const old = this.db.prepare("SELECT rowid, chunk_id FROM chunks WHERE message_id = ?").all(message.messageId) as { rowid: number; chunk_id: string }[];
     for (const row of old) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
     for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(message.messageId);
+    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
+    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
     this.db.prepare("DELETE FROM chunks WHERE message_id = ?").run(message.messageId);
     for (const chunk of buildChunks(message)) {
       const result = this.db.prepare(`INSERT INTO chunks
@@ -448,6 +453,13 @@ function migrate(db: Database.Database): void {
   for (const column of ["labels", "flags", "classifications"]) {
     if (!existingColumns.has(column)) db.exec(`ALTER TABLE messages ADD COLUMN ${column} TEXT NOT NULL DEFAULT '[]'`);
   }
+}
+
+function cleanupOrphanedSemanticRows(db: Database.Database): void {
+  db.prepare(`DELETE FROM embedding_queue
+    WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE chunks.chunk_id = embedding_queue.chunk_id)`).run();
+  db.prepare(`DELETE FROM semantic_vectors
+    WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE chunks.chunk_id = semantic_vectors.chunk_id)`).run();
 }
 
 function literalFtsQuery(query: string): string {
