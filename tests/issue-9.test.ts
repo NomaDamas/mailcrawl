@@ -41,4 +41,32 @@ describe("issue 9: semantic orphan cleanup", () => {
     archive.close();
     rmSync(root, { recursive: true, force: true });
   });
+
+  it("cleans persisted orphan rows before publishing a new generation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-9-upgrade-"));
+    const archivePath = join(root, "archive.sqlite");
+    const archive = new Archive(archivePath);
+    await archive.sync([message("Current content.")]);
+    await archive.indexSemantic();
+    archive.db.prepare(`INSERT INTO semantic_vectors
+      (chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)`)
+      .run("stale-chunk", "stale-hash", "test-model", "[1,0,0]");
+    archive.db.prepare(`INSERT INTO embedding_queue
+      (chunk_id, content_hash, state, attempts) VALUES (?, ?, ?, ?)`)
+      .run("stale-chunk", "stale-hash", "pending", 0);
+    archive.close();
+
+    const reopened = new Archive(archivePath);
+    const generation = await reopened.indexSemanticGeneration(root);
+    const manifest = JSON.parse(readFileSync(join(root, "generations", generation.generation, "manifest.json"), "utf8")) as {
+      vectors: Array<{ chunk_id: string }>;
+    };
+
+    expect(manifest.vectors).toHaveLength(1);
+    expect(manifest.vectors[0]?.chunk_id).not.toBe("stale-chunk");
+    expect(reopened.db.prepare("SELECT COUNT(*) AS count FROM semantic_vectors").get()).toEqual({ count: 1 });
+    expect(reopened.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue").get()).toEqual({ count: 1 });
+    reopened.close();
+    rmSync(root, { recursive: true, force: true });
+  });
 });
