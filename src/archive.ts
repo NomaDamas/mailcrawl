@@ -132,7 +132,6 @@ export class Archive {
     const upsert = this.db.prepare(`INSERT INTO semantic_vectors
       (chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)
       ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, model=excluded.model, vector=excluded.vector`);
-    const embedder = await this.getEmbedder();
     const pending: typeof rows = [];
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
@@ -143,6 +142,7 @@ export class Archive {
     });
     transaction();
     if (!pending.length) return { embedded, reused, archiveRevision: this.revision() };
+    const embedder = await this.getEmbedder();
     const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
