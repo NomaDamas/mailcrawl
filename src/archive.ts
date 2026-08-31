@@ -147,6 +147,8 @@ export class Archive {
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
         upsert.run(row.chunk_id, row.content_hash, embeddingModelName(), JSON.stringify(vectors[index]));
+        this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ? AND content_hash = ?")
+          .run(row.chunk_id, row.content_hash);
         embedded++;
       }
     });
