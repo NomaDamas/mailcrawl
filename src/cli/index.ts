@@ -154,13 +154,14 @@ program
       let semantic: unknown = "missing";
       try { semantic = archive.semanticGeneration(`${dataDir}/semantic`); }
       catch (error) { semantic = redactDiagnostic({ status: "stale", error: error instanceof Error ? error.message : String(error) }); }
+      const semanticCommitted = typeof semantic === "object" && semantic !== null && "generation" in semantic;
       output({
         name: "mailcrawl",
         archive: `${dataDir}/archive.sqlite`,
         archivePresent: existsSync(`${dataDir}/archive.sqlite`),
         fts: "available",
         semantic,
-        recommendation: semantic === "missing" ? "run sync, then index before semantic search" : "semantic index is committed",
+        recommendation: semanticCommitted ? "semantic index is committed" : "run sync, then index before semantic search",
       }, options.json);
     } finally { archive.close(); }
   });

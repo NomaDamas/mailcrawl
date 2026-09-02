@@ -1,6 +1,6 @@
 {
   "name": "@nomadamas/mailcrawl",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Local Himalaya-backed incremental email indexing and hybrid search CLI",
   "license": "MIT",
   "type": "module",
