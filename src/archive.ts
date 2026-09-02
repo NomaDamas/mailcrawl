@@ -1,13 +1,16 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
-import { snippet } from "./util.js";
+import { scopedId, snippet } from "./util.js";
 import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.js";
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
+
+const RETAINED_SEMANTIC_GENERATIONS = 2;
+const SEMANTIC_GENERATION_NAME = /^gen-[0-9a-f]{16}-[0-9]+$/;
 
 export class Archive {
   readonly db: Database.Database;
@@ -20,6 +23,7 @@ export class Archive {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     migrate(this.db);
+    cleanupOrphanedSemanticRows(this.db);
     this.lexicalRebuildRequired = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() === undefined;
     if (!this.lexicalRebuildRequired) {
       const row = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() as { version: string };
@@ -36,14 +40,19 @@ export class Archive {
   }
 
   async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
+    for (const message of messages) {
+      if (typeof message.providerKey !== "string" || !message.providerKey.trim()) throw new Error("message provider identity is required");
+    }
     const excludedCategories = new Set((policy.excludedCategories ?? ["spam", "promotions"]).map(normalizeCategory));
     const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
       ...message,
-      messageId: `${message.accountId}:${message.messageId}`,
-      threadId: `${message.accountId}:${message.threadId}`,
-      providerKey: `${message.accountId}:${message.providerKey}`,
-      inReplyTo: message.inReplyTo ? `${message.accountId}:${message.inReplyTo}` : undefined,
+      messageId: scopedId(message.accountId, message.mailbox, message.messageId),
+      threadId: scopedId(message.accountId, message.mailbox, message.threadId),
+      providerKey: scopedId(message.accountId, message.mailbox, message.providerKey),
+      inReplyTo: message.inReplyTo ? scopedId(message.accountId, message.mailbox, message.inReplyTo) : undefined,
     }));
+    validateIdentities(normalized);
+    validateStoredIdentities(this.db, normalized);
     const excluded = normalized.filter((message) => message.categories.some((category) => excludedCategories.has(category)));
     const included = normalized.filter((message) => !message.categories.some((category) => excludedCategories.has(category)));
     const existing = this.db.prepare("SELECT provider_key, normalized_hash FROM messages").all() as {
@@ -124,6 +133,14 @@ export class Archive {
   }
 
   async indexSemantic(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
+    const completeQueueRow = this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ?");
+    const reconcile = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)").run();
+      this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)
+        SELECT chunk_id, content_hash, 'pending', 0 FROM chunks
+        WHERE chunk_id NOT IN (SELECT chunk_id FROM embedding_queue)`).run();
+    });
+    reconcile();
     const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
       chunk_id: string; text: string; content_hash: string;
     }[];
@@ -136,7 +153,11 @@ export class Archive {
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
         const old = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string; model: string } | undefined;
-        if (old?.content_hash === row.content_hash && old.model === embeddingModelName()) { reused++; continue; }
+        if (old?.content_hash === row.content_hash && old.model === embeddingModelName()) {
+          completeQueueRow.run(row.chunk_id);
+          reused++;
+          continue;
+        }
         pending.push(row);
       }
     });
@@ -147,8 +168,7 @@ export class Archive {
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
         upsert.run(row.chunk_id, row.content_hash, embeddingModelName(), JSON.stringify(vectors[index]));
-        this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ? AND content_hash = ?")
-          .run(row.chunk_id, row.content_hash);
+        completeQueueRow.run(row.chunk_id);
         embedded++;
       }
     });
@@ -168,7 +188,9 @@ export class Archive {
     mkdirSync(staging);
     try {
       const report = await this.indexSemantic();
-      const vectors = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all();
+      const vectors = this.db.prepare(`SELECT v.chunk_id, v.content_hash, v.vector
+        FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id
+        ORDER BY v.chunk_id`).all();
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
         archiveRevision: this.revision(), vectors, model: embeddingModelName(),
       }));
@@ -176,6 +198,7 @@ export class Archive {
       const pointer = join(root, `.CURRENT.${process.pid}`);
       writeFileSync(pointer, `${generation}\n`);
       renameSync(pointer, currentPath);
+      this.cleanupSemanticGenerations(generationRoot, generation);
       return { generation, embedded: report.embedded, reused: report.reused };
     } catch (error) {
       rmSync(staging, { recursive: true, force: true });
@@ -189,6 +212,22 @@ export class Archive {
       });
       restore();
       throw error;
+    }
+  }
+
+  private cleanupSemanticGenerations(generationRoot: string, activeGeneration: string): void {
+    const generations = readdirSync(generationRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && SEMANTIC_GENERATION_NAME.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => {
+        const leftTimestamp = Number(left.slice(left.lastIndexOf("-") + 1));
+        const rightTimestamp = Number(right.slice(right.lastIndexOf("-") + 1));
+        return rightTimestamp - leftTimestamp || right.localeCompare(left);
+      });
+    const retained = new Set(generations.slice(0, RETAINED_SEMANTIC_GENERATIONS));
+    retained.add(activeGeneration);
+    for (const generation of generations) {
+      if (!retained.has(generation)) rmSync(join(generationRoot, generation), { recursive: true, force: true });
     }
   }
 
@@ -347,20 +386,20 @@ export class Archive {
   }
 
   private removeMessage(message: NormalizedMessage): void {
-    const stored = this.db.prepare("SELECT message_id FROM messages WHERE provider_key = ?").get(message.providerKey) as { message_id: string } | undefined;
-    if (!stored) return;
-    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = ?").all(stored.message_id) as { rowid: number }[];
+    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?)").all(message.providerKey) as { rowid: number }[];
     for (const row of rows) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
-    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(stored.message_id);
-    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
-    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
-    this.db.prepare("DELETE FROM messages WHERE message_id = ?").run(stored.message_id);
+    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))`).run(message.providerKey);
+    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
+    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
+    this.db.prepare("DELETE FROM messages WHERE provider_key = ?").run(message.providerKey);
   }
 
   private replaceMessageChunks(message: NormalizedMessage, analyzedChunks?: Map<string, Map<string, string>>): void {
     const old = this.db.prepare("SELECT rowid, chunk_id FROM chunks WHERE message_id = ?").all(message.messageId) as { rowid: number; chunk_id: string }[];
     for (const row of old) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
     for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(message.messageId);
+    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
+    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
     this.db.prepare("DELETE FROM chunks WHERE message_id = ?").run(message.messageId);
     for (const chunk of buildChunks(message)) {
       const result = this.db.prepare(`INSERT INTO chunks
@@ -462,6 +501,13 @@ function migrate(db: Database.Database): void {
   }
 }
 
+function cleanupOrphanedSemanticRows(db: Database.Database): void {
+  db.prepare(`DELETE FROM embedding_queue
+    WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE chunks.chunk_id = embedding_queue.chunk_id)`).run();
+  db.prepare(`DELETE FROM semantic_vectors
+    WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE chunks.chunk_id = semantic_vectors.chunk_id)`).run();
+}
+
 function literalFtsQuery(query: string): string {
   return query.trim().split(/\s+/).map((term) => `"${term.replaceAll('"', '""')}"`).join(" ");
 }
@@ -478,6 +524,26 @@ function addFilters(clauses: string[], params: unknown[], filters: SearchFilters
 
 function normalizeCategory(value: string): string {
   return value.trim().toLocaleLowerCase().replace(/^category[_-]/, "").replace(/^label[_-]/, "");
+}
+
+function validateIdentities(messages: NormalizedMessage[]): void {
+  const providerKeys = new Set<string>();
+  const messageIds = new Set<string>();
+  for (const message of messages) {
+    if (!message.providerKey) throw new Error("message provider identity is required");
+    if (providerKeys.has(message.providerKey)) throw new Error("duplicate message provider identity");
+    providerKeys.add(message.providerKey);
+    if (messageIds.has(message.messageId)) throw new Error("duplicate message identity");
+    messageIds.add(message.messageId);
+  }
+}
+
+function validateStoredIdentities(db: Database.Database, messages: NormalizedMessage[]): void {
+  const byProviderKey = db.prepare("SELECT message_id FROM messages WHERE provider_key = ?");
+  for (const message of messages) {
+    const storedProvider = byProviderKey.get(message.providerKey) as { message_id: string } | undefined;
+    if (storedProvider && storedProvider.message_id !== message.messageId) throw new Error("provider identity already belongs to another message identity");
+  }
 }
 
 function countExcluded(messages: NormalizedMessage[], excluded: Set<string>): Record<string, number> {
