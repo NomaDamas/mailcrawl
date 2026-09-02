@@ -12,6 +12,10 @@ export function makeId(...parts: string[]): string {
   return hash(parts.join("\u0000")).slice(0, 24);
 }
 
+export function scopedId(accountId: string, mailbox: string, value: string): string {
+  return makeId(accountId, mailbox, value);
+}
+
 export function snippet(text: string, query: string, maxChars = 240): string {
   const clean = text.trim();
   if (clean.length <= maxChars) return clean;

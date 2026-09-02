@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Archive } from "../src/archive.js";
+import { scopedId } from "../src/util.js";
 import type { MailMessage } from "../src/types.js";
 
 const messages: MailMessage[] = [
@@ -21,7 +22,7 @@ describe("multilingual indexing and search", () => {
     const archive = new Archive();
     await archive.sync(messages);
     const hits = await archive.searchBm25(query);
-    expect(hits.some((hit) => hit.messageId === `test:${language}`)).toBe(true);
+    expect(hits.some((hit) => hit.messageId === scopedId("test", "INBOX", language))).toBe(true);
     archive.close();
   });
 });

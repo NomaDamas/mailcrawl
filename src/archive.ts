@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
-import { snippet } from "./util.js";
+import { scopedId, snippet } from "./util.js";
 import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.js";
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
 
@@ -36,14 +36,19 @@ export class Archive {
   }
 
   async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
+    for (const message of messages) {
+      if (typeof message.providerKey !== "string" || !message.providerKey.trim()) throw new Error("message provider identity is required");
+    }
     const excludedCategories = new Set((policy.excludedCategories ?? ["spam", "promotions"]).map(normalizeCategory));
     const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
       ...message,
-      messageId: `${message.accountId}:${message.messageId}`,
-      threadId: `${message.accountId}:${message.threadId}`,
-      providerKey: `${message.accountId}:${message.providerKey}`,
-      inReplyTo: message.inReplyTo ? `${message.accountId}:${message.inReplyTo}` : undefined,
+      messageId: scopedId(message.accountId, message.mailbox, message.messageId),
+      threadId: scopedId(message.accountId, message.mailbox, message.threadId),
+      providerKey: scopedId(message.accountId, message.mailbox, message.providerKey),
+      inReplyTo: message.inReplyTo ? scopedId(message.accountId, message.mailbox, message.inReplyTo) : undefined,
     }));
+    validateIdentities(normalized);
+    validateStoredIdentities(this.db, normalized);
     const excluded = normalized.filter((message) => message.categories.some((category) => excludedCategories.has(category)));
     const included = normalized.filter((message) => !message.categories.some((category) => excludedCategories.has(category)));
     const existing = this.db.prepare("SELECT provider_key, normalized_hash FROM messages").all() as {
@@ -335,14 +340,12 @@ export class Archive {
   }
 
   private removeMessage(message: NormalizedMessage): void {
-    const stored = this.db.prepare("SELECT message_id FROM messages WHERE provider_key = ?").get(message.providerKey) as { message_id: string } | undefined;
-    if (!stored) return;
-    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = ?").all(stored.message_id) as { rowid: number }[];
+    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?)").all(message.providerKey) as { rowid: number }[];
     for (const row of rows) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
-    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(stored.message_id);
-    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
-    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(stored.message_id);
-    this.db.prepare("DELETE FROM messages WHERE message_id = ?").run(stored.message_id);
+    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))`).run(message.providerKey);
+    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
+    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
+    this.db.prepare("DELETE FROM messages WHERE provider_key = ?").run(message.providerKey);
   }
 
   private replaceMessageChunks(message: NormalizedMessage, analyzedChunks?: Map<string, Map<string, string>>): void {
@@ -466,6 +469,26 @@ function addFilters(clauses: string[], params: unknown[], filters: SearchFilters
 
 function normalizeCategory(value: string): string {
   return value.trim().toLocaleLowerCase().replace(/^category[_-]/, "").replace(/^label[_-]/, "");
+}
+
+function validateIdentities(messages: NormalizedMessage[]): void {
+  const providerKeys = new Set<string>();
+  const messageIds = new Set<string>();
+  for (const message of messages) {
+    if (!message.providerKey) throw new Error("message provider identity is required");
+    if (providerKeys.has(message.providerKey)) throw new Error("duplicate message provider identity");
+    providerKeys.add(message.providerKey);
+    if (messageIds.has(message.messageId)) throw new Error("duplicate message identity");
+    messageIds.add(message.messageId);
+  }
+}
+
+function validateStoredIdentities(db: Database.Database, messages: NormalizedMessage[]): void {
+  const byProviderKey = db.prepare("SELECT message_id FROM messages WHERE provider_key = ?");
+  for (const message of messages) {
+    const storedProvider = byProviderKey.get(message.providerKey) as { message_id: string } | undefined;
+    if (storedProvider && storedProvider.message_id !== message.messageId) throw new Error("provider identity already belongs to another message identity");
+  }
 }
 
 function countExcluded(messages: NormalizedMessage[], excluded: Set<string>): Record<string, number> {

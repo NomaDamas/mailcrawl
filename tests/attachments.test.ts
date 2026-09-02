@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Archive } from "../src/archive.js";
+import { scopedId } from "../src/util.js";
 
 describe("attachment metadata", () => {
   it("lists metadata without exposing file contents by default", async () => {
@@ -10,7 +11,7 @@ describe("attachment metadata", () => {
       date: "2026-08-26T00:00:00Z", text: "body",
       attachments: [{ name: "../../secret.txt", mimeType: "text/plain", size: 10, text: "safe extracted text" }],
     }]);
-    expect(archive.listAttachments("a:m")).toMatchObject([
+    expect(archive.listAttachments(scopedId("a", "INBOX", "m"))).toMatchObject([
       { name: "../../secret.txt", extractedText: "safe extracted text" },
     ]);
     archive.close();
