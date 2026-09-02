@@ -28,7 +28,18 @@ export async function normalizeMessage(input: MailMessage): Promise<NormalizedMe
   const subject = input.subject.trim();
   const messageId = input.messageId || input.providerKey;
   const threadId = input.threadId || makeId(input.accountId, normalizeSubject(subject));
-  const normalizedHash = hash(JSON.stringify([subject, input.from, input.to, input.cc, latest, quoted, input.labels, input.flags, input.classifications]));
+  const attachmentInputs = (attachments || []).map((attachment) => [
+    attachment.name,
+    attachment.mimeType,
+    attachment.size ?? null,
+    attachment.text ?? null,
+    attachment.contentHash ?? null,
+  ]);
+  const normalizedHash = hash(JSON.stringify([
+    subject, input.from, input.to, input.cc, latest, quoted,
+    input.labels, input.flags, input.classifications,
+    ...(attachmentInputs.length ? [attachmentInputs] : []),
+  ]));
   const categories = [...new Set([
     ...(input.classifications || []),
     ...(input.labels || []),
