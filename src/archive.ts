@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
@@ -8,6 +8,9 @@ import { normalizeMessage } from "./normalize.js";
 import { scopedId, snippet } from "./util.js";
 import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.js";
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
+
+const RETAINED_SEMANTIC_GENERATIONS = 2;
+const SEMANTIC_GENERATION_NAME = /^gen-[0-9a-f]{16}-[0-9]+$/;
 
 export class Archive {
   readonly db: Database.Database;
@@ -192,10 +195,27 @@ export class Archive {
       const pointer = join(root, `.CURRENT.${process.pid}`);
       writeFileSync(pointer, `${generation}\n`);
       renameSync(pointer, currentPath);
+      this.cleanupSemanticGenerations(generationRoot, generation);
       return { generation, embedded: report.embedded, reused: report.reused };
     } catch (error) {
       rmSync(staging, { recursive: true, force: true });
       throw error;
+    }
+  }
+
+  private cleanupSemanticGenerations(generationRoot: string, activeGeneration: string): void {
+    const generations = readdirSync(generationRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && SEMANTIC_GENERATION_NAME.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => {
+        const leftTimestamp = Number(left.slice(left.lastIndexOf("-") + 1));
+        const rightTimestamp = Number(right.slice(right.lastIndexOf("-") + 1));
+        return rightTimestamp - leftTimestamp || right.localeCompare(left);
+      });
+    const retained = new Set(generations.slice(0, RETAINED_SEMANTIC_GENERATIONS));
+    retained.add(activeGeneration);
+    for (const generation of generations) {
+      if (!retained.has(generation)) rmSync(join(generationRoot, generation), { recursive: true, force: true });
     }
   }
 
