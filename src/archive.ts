@@ -192,9 +192,12 @@ export class Archive {
   private async indexSemanticGenerationUnlocked(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
     const currentPath = join(root, "CURRENT");
     const generationRoot = join(root, "generations");
+    const previousVectors = this.db.prepare("SELECT chunk_id, content_hash, model, vector FROM semantic_vectors ORDER BY chunk_id").all() as SemanticVectorRow[];
+    const previousQueue = this.db.prepare("SELECT chunk_id, content_hash, state, attempts FROM embedding_queue ORDER BY chunk_id").all() as EmbeddingQueueRow[];
     mkdirSync(generationRoot, { recursive: true });
     const generation = `gen-${this.revision().slice(0, 16)}-${Date.now()}`;
     const staging = join(generationRoot, `.${generation}.staging`);
+    const publishedGeneration = join(generationRoot, generation);
     mkdirSync(staging);
     try {
       const report = await this.indexSemanticUnlocked();
@@ -204,7 +207,7 @@ export class Archive {
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
         archiveRevision: this.revision(), vectors, model: embeddingModelName(),
       }));
-      renameSync(staging, join(generationRoot, generation));
+      renameSync(staging, publishedGeneration);
       const pointer = join(root, `.CURRENT.${process.pid}`);
       writeFileSync(pointer, `${generation}\n`);
       renameSync(pointer, currentPath);
@@ -212,6 +215,15 @@ export class Archive {
       return { generation, embedded: report.embedded, reused: report.reused };
     } catch (error) {
       rmSync(staging, { recursive: true, force: true });
+      rmSync(publishedGeneration, { recursive: true, force: true });
+      const restore = this.db.transaction(() => {
+        this.db.exec("DELETE FROM semantic_vectors; DELETE FROM embedding_queue;");
+        const restoreVector = this.db.prepare("INSERT INTO semantic_vectors(chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)");
+        for (const row of previousVectors) restoreVector.run(row.chunk_id, row.content_hash, row.model, row.vector);
+        const restoreQueue = this.db.prepare("INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts) VALUES (?, ?, ?, ?)");
+        for (const row of previousQueue) restoreQueue.run(row.chunk_id, row.content_hash, row.state, row.attempts);
+      });
+      restore();
       throw error;
     }
   }
@@ -570,6 +582,8 @@ function countExcluded(messages: NormalizedMessage[], excluded: Set<string>): Re
   return counts;
 }
 
+type SemanticVectorRow = { chunk_id: string; content_hash: string; model: string; vector: string };
+type EmbeddingQueueRow = { chunk_id: string; content_hash: string; state: string; attempts: number };
 type SearchRow = { chunk_id: string; message_id: string; thread_id: string; account_id: string; mailbox: string; subject: string; from_address: string; to_addresses: string; date: string; snippet: string; score: number };
 type SemanticRow = Omit<SearchRow, "snippet" | "score"> & { vector: string; text: string };
 type AttachmentRow = {
