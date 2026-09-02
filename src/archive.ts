@@ -16,6 +16,7 @@ export class Archive {
   readonly db: Database.Database;
   private embedder?: Embedder;
   private lexical?: LexicalAnalyzers;
+  private operationTail: Promise<void> = Promise.resolve();
   private lexicalRebuildRequired: boolean;
 
   constructor(path = ":memory:") {
@@ -40,6 +41,10 @@ export class Archive {
   }
 
   async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
+    return this.runExclusive(() => this.syncUnlocked(messages, policy));
+  }
+
+  private async syncUnlocked(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
     for (const message of messages) {
       if (typeof message.providerKey !== "string" || !message.providerKey.trim()) throw new Error("message provider identity is required");
     }
@@ -133,6 +138,10 @@ export class Archive {
   }
 
   async indexSemantic(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
+    return this.runExclusive(() => this.indexSemanticUnlocked());
+  }
+
+  private async indexSemanticUnlocked(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
     const completeQueueRow = this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ?");
     const reconcile = this.db.transaction(() => {
       this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)").run();
@@ -177,6 +186,10 @@ export class Archive {
   }
 
   async indexSemanticGeneration(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
+    return this.runExclusive(() => this.indexSemanticGenerationUnlocked(root));
+  }
+
+  private async indexSemanticGenerationUnlocked(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
     const currentPath = join(root, "CURRENT");
     const generationRoot = join(root, "generations");
     mkdirSync(generationRoot, { recursive: true });
@@ -184,7 +197,7 @@ export class Archive {
     const staging = join(generationRoot, `.${generation}.staging`);
     mkdirSync(staging);
     try {
-      const report = await this.indexSemantic();
+      const report = await this.indexSemanticUnlocked();
       const vectors = this.db.prepare(`SELECT v.chunk_id, v.content_hash, v.vector
         FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id
         ORDER BY v.chunk_id`).all();
@@ -413,6 +426,19 @@ export class Archive {
   private revision(): string {
     const rows = this.db.prepare("SELECT chunk_id, content_hash FROM chunks ORDER BY chunk_id").all() as { chunk_id: string; content_hash: string }[];
     return createHash("sha256").update(rows.map((row) => `${row.chunk_id}\0${row.content_hash}`).join("\0")).digest("hex");
+  }
+
+  private async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.operationTail;
+    let release = (): void => {};
+    const turn = new Promise<void>((resolve) => { release = resolve; });
+    this.operationTail = previous.then(() => turn);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private async getEmbedder(): Promise<Embedder> {
