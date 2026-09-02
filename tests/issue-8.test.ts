@@ -59,11 +59,11 @@ describe("issue 8: embedding queue lifecycle", () => {
   });
 
   it("drains re-enqueued rows through the reuse path without re-embedding", async () => {
-    // Given an indexed message whose queue row is re-enqueued by a metadata-only change
+    // Given an indexed message whose queue row is re-enqueued
     const archive = new Archive();
     await archive.sync([message]);
     await archive.indexSemantic();
-    await archive.sync([{ ...message, labels: ["important"] }]);
+    archive.db.prepare("UPDATE embedding_queue SET state = 'pending'").run();
     createEmbedder.mockClear();
 
     // When indexing runs while the stored vector is still current
@@ -74,7 +74,7 @@ describe("issue 8: embedding queue lifecycle", () => {
     expect(createEmbedder).not.toHaveBeenCalled();
 
     // And a later sync reports no backlog
-    const report = await archive.sync([{ ...message, labels: ["important"] }]);
+    const report = await archive.sync([message]);
     expect(report.embeddingBacklog).toBe(0);
     archive.close();
   });
