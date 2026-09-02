@@ -129,6 +129,14 @@ export class Archive {
   }
 
   async indexSemantic(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
+    const completeQueueRow = this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ?");
+    const reconcile = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)").run();
+      this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)
+        SELECT chunk_id, content_hash, 'pending', 0 FROM chunks
+        WHERE chunk_id NOT IN (SELECT chunk_id FROM embedding_queue)`).run();
+    });
+    reconcile();
     const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
       chunk_id: string; text: string; content_hash: string;
     }[];
@@ -141,7 +149,11 @@ export class Archive {
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
         const old = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string; model: string } | undefined;
-        if (old?.content_hash === row.content_hash && old.model === embeddingModelName()) { reused++; continue; }
+        if (old?.content_hash === row.content_hash && old.model === embeddingModelName()) {
+          completeQueueRow.run(row.chunk_id);
+          reused++;
+          continue;
+        }
         pending.push(row);
       }
     });
@@ -152,8 +164,7 @@ export class Archive {
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
         upsert.run(row.chunk_id, row.content_hash, embeddingModelName(), JSON.stringify(vectors[index]));
-        this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ? AND content_hash = ?")
-          .run(row.chunk_id, row.content_hash);
+        completeQueueRow.run(row.chunk_id);
         embedded++;
       }
     });
