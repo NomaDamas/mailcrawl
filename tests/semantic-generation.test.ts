@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Archive } from "../src/archive.js";
 
 const { failPointerPublication } = vi.hoisted(() => ({ failPointerPublication: { value: false } }));
@@ -11,7 +11,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     renameSync: (source: Parameters<typeof actual.renameSync>[0], target: Parameters<typeof actual.renameSync>[1]) => {
-      if (failPointerPublication.value && String(source).includes(".CURRENT.") && String(target).endsWith("/CURRENT")) {
+      if (failPointerPublication.value && String(source).includes(".CURRENT.") && basename(String(target)) === "CURRENT") {
         throw new Error("injected CURRENT publication failure");
       }
       return actual.renameSync(source, target);

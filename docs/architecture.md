@@ -159,10 +159,10 @@ All commands support `--json` where machine-readable output is useful.
 mailcrawl doctor
 mailcrawl status
 mailcrawl sync
-mailcrawl embed [--limit N]
-mailcrawl search --mode fts|semantic|hybrid [--limit N] [--mailbox NAME] QUERY
+mailcrawl embed
+mailcrawl search --mode fts|bm25|keyword|semantic|hybrid [--limit N] [--mailbox NAME] QUERY
 mailcrawl message get MESSAGE_ID
-mailcrawl repair [--fts|--vectors|--all]
+mailcrawl repair [--fts|--semantic|--all]
 ```
 
 Example sync response:

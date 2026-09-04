@@ -44,6 +44,17 @@ export class Archive {
     return this.runExclusive(() => this.syncUnlocked(messages, policy));
   }
 
+  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; archiveRevision: string } {
+    const count = (table: "messages" | "chunks"): number =>
+      Number((this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
+    return {
+      messageCount: count("messages"),
+      chunkCount: count("chunks"),
+      embeddingBacklog: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count),
+      archiveRevision: this.revision(),
+    };
+  }
+
   private async syncUnlocked(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
     for (const message of messages) {
       if (typeof message.providerKey !== "string" || !message.providerKey.trim()) throw new Error("message provider identity is required");
