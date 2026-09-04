@@ -114,7 +114,7 @@ describe("semantic generations", () => {
       expect(readdirSync(join(root, "generations"))).toEqual(expect.arrayContaining([
         second.generation, third.generation, "unrelated", `.${first.generation}.staging`,
       ]));
-      expect(readdirSync(join(root, "generations")).filter((name) => /^gen-[0-9a-f]{16}-[0-9]+$/.test(name))).toHaveLength(2);
+      expect(readdirSync(join(root, "generations")).filter((name) => /^gen-[0-9a-f]{16}-[0-9]+(?:-[0-9a-f]+)?$/.test(name))).toHaveLength(2);
     } finally {
       archive.close();
       rmSync(root, { recursive: true, force: true });

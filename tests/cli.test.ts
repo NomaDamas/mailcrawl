@@ -22,7 +22,7 @@ describe("CLI contract", () => {
         recommendation: string;
       };
 
-      expect(output.semantic.status).toBe("stale");
+      expect(output.semantic.status).toBe("missing");
       expect(output.recommendation).toBe("run sync, then index before semantic search");
     } finally {
       await rm(dataDir, { recursive: true, force: true });
@@ -51,7 +51,7 @@ describe("CLI contract", () => {
       expect(JSON.parse(sync.stdout)).toMatchObject({ added: 2 });
 
       const status = await run("node", [...cli, "status", "--json"], { env: environment });
-      expect(JSON.parse(status.stdout)).toMatchObject({ archivePresent: true, messageCount: 2, chunkCount: 2 });
+      expect(JSON.parse(status.stdout)).toMatchObject({ archivePresent: true, messageCount: 2, chunkCount: 2, fts: { status: "healthy", rows: 2 } });
 
       const embed = await run("node", [...cli, "embed", "--json"], { env: environment });
       expect(JSON.parse(embed.stdout)).toMatchObject({ embedded: 2 });
@@ -70,5 +70,15 @@ describe("CLI contract", () => {
 
   it("keeps malformed commands as nonzero failures", async () => {
     await expect(run("node", ["dist/cli/index.js", "not-a-command"])).rejects.toMatchObject({ code: 1 });
+  });
+
+  it("rejects an unsupported sync source before invoking Himalaya", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mailcrawl-cli-source-"));
+    try {
+      await expect(run("node", ["dist/cli/index.js", "--data-dir", dataDir, "sync", "--source", "typo", "--json"]))
+        .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("unsupported source: typo") });
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 });

@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import type { MailMessage } from "./types.js";
+import { redactDiagnostic } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,7 +32,7 @@ export class HimalayaSource implements MailSource {
     const args = this.config ? ["-c", this.config, "-a", this.account] : ["-a", this.account];
     if (this.backend) args.push("-b", this.backend);
     args.push("envelope", "list", "--mailbox", this.mailbox, "--page-size", String(this.pageSize), "--json");
-    const { stdout } = await execFileAsync("himalaya", args, { maxBuffer: 16 * 1024 * 1024 });
+    const { stdout } = await runHimalaya(args, 16 * 1024 * 1024, "envelope list");
     const payload = JSON.parse(stdout) as { envelopes?: HimalayaEnvelope[] };
     const envelopes = payload.envelopes ?? (Array.isArray(payload) ? payload as unknown as HimalayaEnvelope[] : []);
     return Promise.all(envelopes.map(async (envelope) => {
@@ -61,9 +62,18 @@ export class HimalayaSource implements MailSource {
     const args = this.config ? ["-c", this.config, "-a", this.account] : ["-a", this.account];
     if (this.backend) args.push("-b", this.backend);
     args.push("--json", "message", "read", id, "--raw");
-    const { stdout } = await execFileAsync("himalaya", args, { maxBuffer: 32 * 1024 * 1024 });
+    const { stdout } = await runHimalaya(args, 32 * 1024 * 1024, "message read");
     const payload = JSON.parse(stdout) as { message?: string };
     return payload.message ?? stdout;
+  }
+}
+
+async function runHimalaya(args: string[], maxBuffer: number, operation: string): Promise<{ stdout: string }> {
+  try {
+    return await execFileAsync("himalaya", args, { maxBuffer });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`himalaya ${operation} failed: ${redactDiagnostic(detail)}`);
   }
 }
 

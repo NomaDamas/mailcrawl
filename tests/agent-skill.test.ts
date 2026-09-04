@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 describe("Vercel Agent Skill", () => {
   it("provides a discoverable skill with valid front matter", async () => {
     const document = await readFile("skills/mailcrawl/SKILL.md", "utf8");
-    expect(document.startsWith("---\n")).toBe(true);
+    expect(document).toMatch(/^---\r?\n/u);
     expect(document).toMatch(/\nname:\s*mailcrawl\s*\n/);
     expect(document).toMatch(/\ndescription:\s*.+\n/);
     expect(document).toContain("\n---\n");

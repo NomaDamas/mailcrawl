@@ -92,7 +92,9 @@ Check health and rebuild lexical data when needed:
 mailcrawl doctor --json
 mailcrawl status --json
 mailcrawl embed --json
-mailcrawl repair --fts|--semantic|--all --json
+mailcrawl repair --fts --json
+mailcrawl repair --semantic --json
+mailcrawl repair --all --json
 ```
 
 `doctor` reports archive, FTS, and semantic-generation state. `repair` is a

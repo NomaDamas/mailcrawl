@@ -26,12 +26,15 @@ program
   .option("--json")
   .action(async (options: SyncOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
+    if (options.source !== "fixture" && options.source !== "himalaya") throw new Error(`unsupported source: ${options.source}`);
+    if (options.source === "fixture" && !options.fixture) throw new Error("--fixture is required for fixture source");
+    if (options.source === "himalaya" && !options.account) throw new Error("--account is required for himalaya source");
     await mkdir(dataDir, { recursive: true });
     const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
       const source = options.source === "fixture"
-        ? new FixtureSource(options.fixture!)
-        : new HimalayaSource(options.account!, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
+        ? fixtureSource(options)
+        : himalayaSource(options);
       const excludedCategories = (options.excludeCategory.length ? options.excludeCategory : ["spam", "promotions"])
         .filter((category) => !options.includeCategory.includes(category));
       output(await archive.sync(await source.list(), { excludedCategories }), options.json);
@@ -154,14 +157,14 @@ program
     const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
       let semantic: unknown = "missing";
-      try { semantic = archive.semanticGeneration(join(dataDir, "semantic")); }
-      catch (error) { semantic = redactDiagnostic({ status: "stale", error: error instanceof Error ? error.message : String(error) }); }
+      try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
+      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
       const semanticCommitted = typeof semantic === "object" && semantic !== null && "generation" in semantic;
       output({
         name: "mailcrawl",
         archive: join(dataDir, "archive.sqlite"),
         archivePresent: existsSync(join(dataDir, "archive.sqlite")),
-        fts: "available",
+        fts: archive.status().fts,
         semantic,
         recommendation: semanticCommitted ? "semantic index is committed" : "run sync, then index before semantic search",
       }, options.json);
@@ -175,14 +178,14 @@ program
     const dataDir = command.parent!.opts().dataDir as string;
     const archivePath = join(dataDir, "archive.sqlite");
     if (!existsSync(archivePath)) {
-      output({ name: "mailcrawl", archive: archivePath, archivePresent: false, messageCount: 0, chunkCount: 0, embeddingBacklog: 0 }, options.json);
+      output({ name: "mailcrawl", archive: archivePath, archivePresent: false, messageCount: 0, chunkCount: 0, embeddingBacklog: 0, fts: { status: "missing", rows: 0 }, semantic: { status: "missing" } }, options.json);
       return;
     }
     const archive = new Archive(archivePath);
     try {
       let semantic: unknown = "missing";
-      try { semantic = archive.semanticGeneration(join(dataDir, "semantic")); }
-      catch (error) { semantic = redactDiagnostic({ status: "stale", error: error instanceof Error ? error.message : String(error) }); }
+      try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
+      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
       output({ name: "mailcrawl", archive: archivePath, archivePresent: true, ...archive.status(), semantic }, options.json);
     } finally { archive.close(); }
   });
@@ -199,8 +202,8 @@ program
     try {
       if (!options.fts && !options.semantic && !options.all) throw new Error("pass --fts, --semantic, or --all");
       const result: Record<string, unknown> = {};
-      if (options.fts || options.all) result.fts = archive.repairFts();
       if (options.semantic || options.all) result.semantic = await archive.indexSemanticGeneration(join(dataDir, "semantic"));
+      if (options.fts || options.all) result.fts = archive.repairFts();
       output(options.all ? result : result.fts ?? result.semantic, options.json);
     } finally { archive.close(); }
   });
@@ -217,7 +220,7 @@ attachments
 
 program.parseAsync().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(JSON.stringify({ error: message }));
+  console.error(JSON.stringify(redactDiagnostic({ error: message })));
   process.exitCode = 1;
 });
 
@@ -226,6 +229,20 @@ interface SyncOptions extends JsonOptions { source: string; fixture?: string; ac
 interface SearchOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
+}
+function fixtureSource(options: SyncOptions): FixtureSource {
+  if (!options.fixture) throw new Error("--fixture is required for selected source");
+  return new FixtureSource(options.fixture);
+}
+function himalayaSource(options: SyncOptions): HimalayaSource {
+  if (!options.account) throw new Error("--account is required for selected source");
+  return new HimalayaSource(options.account, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
+}
+function semanticStatus(archive: Archive, semantic: { generation: string; archiveRevision: string; vectorCount: number }): object {
+  return semantic.archiveRevision === archive.status().archiveRevision ? { ...semantic, status: "healthy" } : { ...semantic, status: "stale" };
+}
+function semanticErrorStatus(error: unknown): "missing" | "corrupt" {
+  return error instanceof Error && "code" in error && error.code === "ENOENT" ? "missing" : "corrupt";
 }
 function output(value: unknown, json?: boolean): void {
   if (json) console.log(JSON.stringify(value));
