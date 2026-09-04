@@ -71,7 +71,8 @@ mailcrawl sync --source fixture --fixture ./messages.json --json
 
 ## Safe read and maintenance commands
 
-Search modes are `bm25`, `keyword`, `semantic`, and `hybrid`. Use metadata
+Search modes are `fts`, `bm25`, `keyword`, `semantic`, and `hybrid`; `fts` and
+`keyword` are aliases for BM25 lexical search. Use metadata
 filters such as `--mailbox`, `--from`, `--to`, `--thread`, `--after`, and
 `--before`. Empty queries and unsupported modes fail with a non-zero exit.
 
@@ -89,7 +90,11 @@ Check health and rebuild lexical data when needed:
 
 ```bash
 mailcrawl doctor --json
+mailcrawl status --json
+mailcrawl embed --json
 mailcrawl repair --fts --json
+mailcrawl repair --semantic --json
+mailcrawl repair --all --json
 ```
 
 `doctor` reports archive, FTS, and semantic-generation state. `repair` is a

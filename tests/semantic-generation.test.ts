@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Archive } from "../src/archive.js";
 
 const { failPointerPublication } = vi.hoisted(() => ({ failPointerPublication: { value: false } }));
@@ -11,7 +11,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return {
     ...actual,
     renameSync: (source: Parameters<typeof actual.renameSync>[0], target: Parameters<typeof actual.renameSync>[1]) => {
-      if (failPointerPublication.value && String(source).includes(".CURRENT.") && String(target).endsWith("/CURRENT")) {
+      if (failPointerPublication.value && String(source).includes(".CURRENT.") && basename(String(target)) === "CURRENT") {
         throw new Error("injected CURRENT publication failure");
       }
       return actual.renameSync(source, target);
@@ -20,6 +20,19 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 describe("semantic generations", () => {
+  it("rejects a path traversal semantic pointer", () => {
+    const archive = new Archive();
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-semantic-pointer-"));
+    try {
+      mkdirSync(join(root, "generations"));
+      writeFileSync(join(root, "CURRENT"), "../../outside");
+      expect(() => archive.semanticGeneration(root)).toThrow("invalid semantic generation pointer");
+    } finally {
+      archive.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores SQLite vectors and queue rows when CURRENT publication fails", async () => {
     const archive = new Archive();
     await archive.sync([{
@@ -46,6 +59,7 @@ describe("semantic generations", () => {
 
     expect(archive.db.prepare("SELECT * FROM semantic_vectors ORDER BY chunk_id").all()).toEqual(vectorsBefore);
     expect(archive.db.prepare("SELECT * FROM embedding_queue ORDER BY chunk_id").all()).toEqual(queueBefore);
+    expect(readdirSync(root).filter((name) => name.startsWith(".CURRENT."))).toHaveLength(0);
     expect(archive.semanticGeneration(root).generation).toBe(first.generation);
     failPointerPublication.value = false;
     archive.close();
@@ -114,7 +128,7 @@ describe("semantic generations", () => {
       expect(readdirSync(join(root, "generations"))).toEqual(expect.arrayContaining([
         second.generation, third.generation, "unrelated", `.${first.generation}.staging`,
       ]));
-      expect(readdirSync(join(root, "generations")).filter((name) => /^gen-[0-9a-f]{16}-[0-9]+$/.test(name))).toHaveLength(2);
+      expect(readdirSync(join(root, "generations")).filter((name) => /^gen-[0-9a-f]{16}-[0-9]+(?:-[0-9a-f]+)?$/.test(name))).toHaveLength(2);
     } finally {
       archive.close();
       rmSync(root, { recursive: true, force: true });
