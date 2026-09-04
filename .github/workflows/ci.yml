@@ -42,3 +42,38 @@ jobs:
 
       - name: Validate skill
         run: npm run validate:skill
+
+  platform-e2e:
+    name: Platform E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify local TypeScript compiler
+        run: node -e "const fs=require('node:fs'); if (!fs.existsSync('node_modules/.bin/tsc')) process.exit(1); console.log(require('node:child_process').execFileSync(process.execPath, ['node_modules/typescript/bin/tsc','--version'], {encoding:'utf8'}).trim())"
+
+      - name: CLI help
+        run: node dist/cli/index.js --help
+
+      - name: Fixture sync
+        run: node dist/cli/index.js --data-dir .tmp/issue-25-e2e sync --source fixture --fixture tests/fixtures/messages.json --json
