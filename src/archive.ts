@@ -376,7 +376,6 @@ export class Archive {
     }[];
     const rebuild = this.db.transaction(() => {
       this.db.exec("DELETE FROM chunks_fts");
-    for (const language of lexicalFields()) this.db.exec(`DELETE FROM chunks_fts_${language}`);
       for (const row of rows) {
         const message = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(row.message_id) as MessageRow;
         this.db.prepare(`INSERT INTO chunks_fts(rowid, subject, from_address, to_addresses, thread_subject,
@@ -386,8 +385,6 @@ export class Archive {
       }
     });
     rebuild();
-    this.db.prepare("DELETE FROM lexical_index_meta WHERE id = 1").run();
-    this.lexicalRebuildRequired = true;
     return { rows: rows.length, status: "repaired" };
   }
 
