@@ -20,6 +20,19 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 describe("semantic generations", () => {
+  it("rejects a path traversal semantic pointer", () => {
+    const archive = new Archive();
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-semantic-pointer-"));
+    try {
+      mkdirSync(join(root, "generations"));
+      writeFileSync(join(root, "CURRENT"), "../../outside");
+      expect(() => archive.semanticGeneration(root)).toThrow("invalid semantic generation pointer");
+    } finally {
+      archive.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores SQLite vectors and queue rows when CURRENT publication fails", async () => {
     const archive = new Archive();
     await archive.sync([{
