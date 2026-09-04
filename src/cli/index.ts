@@ -204,7 +204,7 @@ program
       const result: Record<string, unknown> = {};
       if (options.semantic || options.all) result.semantic = await archive.indexSemanticGeneration(join(dataDir, "semantic"));
       if (options.fts || options.all) result.fts = archive.repairFts();
-      output(options.all ? result : result.fts ?? result.semantic, options.json);
+      output(Object.keys(result).length === 1 ? Object.values(result)[0] : result, options.json);
     } finally { archive.close(); }
   });
 

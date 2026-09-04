@@ -213,6 +213,7 @@ export class Archive {
     const generation = `gen-${this.revision().slice(0, 16)}-${Date.now()}-${randomBytes(6).toString("hex")}`;
     const staging = join(generationRoot, `.${generation}.staging`);
     const publishedGeneration = join(generationRoot, generation);
+    const pointer = join(root, `.CURRENT.${process.pid}`);
     mkdirSync(staging);
     let published = false;
     try {
@@ -225,13 +226,13 @@ export class Archive {
       }));
       renameSync(staging, publishedGeneration);
       published = true;
-      const pointer = join(root, `.CURRENT.${process.pid}`);
       writeFileSync(pointer, `${generation}\n`);
       renameSync(pointer, currentPath);
       this.cleanupSemanticGenerations(generationRoot, generation);
       return { generation, embedded: report.embedded, reused: report.reused };
     } catch (error) {
       rmSync(staging, { recursive: true, force: true });
+      rmSync(pointer, { force: true });
       if (!published) rmSync(publishedGeneration, { recursive: true, force: true });
       const restore = this.db.transaction(() => {
         this.db.exec("DELETE FROM semantic_vectors; DELETE FROM embedding_queue;");

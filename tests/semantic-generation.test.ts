@@ -46,6 +46,7 @@ describe("semantic generations", () => {
 
     expect(archive.db.prepare("SELECT * FROM semantic_vectors ORDER BY chunk_id").all()).toEqual(vectorsBefore);
     expect(archive.db.prepare("SELECT * FROM embedding_queue ORDER BY chunk_id").all()).toEqual(queueBefore);
+    expect(readdirSync(root).filter((name) => name.startsWith(".CURRENT."))).toHaveLength(0);
     expect(archive.semanticGeneration(root).generation).toBe(first.generation);
     failPointerPublication.value = false;
     archive.close();
