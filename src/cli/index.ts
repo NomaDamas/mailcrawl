@@ -67,6 +67,8 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
       try {
         const result = mode === "bm25"
           ? await archive.searchBm25(query, filters(options), Number(options.limit))
+          : mode === "keyword"
+            ? await archive.searchBm25(query, filters(options), Number(options.limit))
           : mode === "hybrid"
             ? await archive.searchHybrid(query, filters(options), Number(options.limit))
             : await archive.searchSemantic(query, filters(options), Number(options.limit));
