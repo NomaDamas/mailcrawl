@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 
 const path = "skills/mailcrawl/SKILL.md";
-const document = await readFile(path, "utf8");
+const document = (await readFile(path, "utf8")).replace(/\r\n/g, "\n");
 const errors = [];
 
 if (!document.startsWith("---\n")) errors.push("missing front matter start");

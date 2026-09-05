@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
@@ -10,7 +10,7 @@ import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.j
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
 
 const RETAINED_SEMANTIC_GENERATIONS = 2;
-const SEMANTIC_GENERATION_NAME = /^gen-[0-9a-f]{16}-[0-9]+$/;
+const SEMANTIC_GENERATION_NAME = /^gen-[0-9a-f]{16}-[0-9]+(?:-[0-9a-f]+)?$/;
 
 export class Archive {
   readonly db: Database.Database;
@@ -42,6 +42,21 @@ export class Archive {
 
   async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
     return this.runExclusive(() => this.syncUnlocked(messages, policy));
+  }
+
+  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
+    const count = (table: "messages" | "chunks"): number =>
+      Number((this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
+    const ftsRows = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks_fts").get() as { count: number }).count);
+    const metadata = this.db.prepare("SELECT version FROM lexical_index_meta WHERE id = 1").get() as { version: string } | undefined;
+    const chunkCount = count("chunks");
+    return {
+      messageCount: count("messages"),
+      chunkCount,
+      embeddingBacklog: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count),
+      archiveRevision: this.revision(),
+      fts: { status: metadata?.version === LEXICAL_ANALYZER_VERSION && ftsRows === chunkCount ? "healthy" : "stale", rows: ftsRows },
+    };
   }
 
   private async syncUnlocked(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
@@ -195,10 +210,12 @@ export class Archive {
     const previousVectors = this.db.prepare("SELECT chunk_id, content_hash, model, vector FROM semantic_vectors ORDER BY chunk_id").all() as SemanticVectorRow[];
     const previousQueue = this.db.prepare("SELECT chunk_id, content_hash, state, attempts FROM embedding_queue ORDER BY chunk_id").all() as EmbeddingQueueRow[];
     mkdirSync(generationRoot, { recursive: true });
-    const generation = `gen-${this.revision().slice(0, 16)}-${Date.now()}`;
+    const generation = `gen-${this.revision().slice(0, 16)}-${Date.now()}-${randomBytes(6).toString("hex")}`;
     const staging = join(generationRoot, `.${generation}.staging`);
     const publishedGeneration = join(generationRoot, generation);
+    const pointer = join(root, `.CURRENT.${process.pid}`);
     mkdirSync(staging);
+    let published = false;
     try {
       const report = await this.indexSemanticUnlocked();
       const vectors = this.db.prepare(`SELECT v.chunk_id, v.content_hash, v.vector
@@ -208,14 +225,15 @@ export class Archive {
         archiveRevision: this.revision(), vectors, model: embeddingModelName(),
       }));
       renameSync(staging, publishedGeneration);
-      const pointer = join(root, `.CURRENT.${process.pid}`);
+      published = true;
       writeFileSync(pointer, `${generation}\n`);
       renameSync(pointer, currentPath);
       this.cleanupSemanticGenerations(generationRoot, generation);
       return { generation, embedded: report.embedded, reused: report.reused };
     } catch (error) {
       rmSync(staging, { recursive: true, force: true });
-      rmSync(publishedGeneration, { recursive: true, force: true });
+      rmSync(pointer, { force: true });
+      if (!published) rmSync(publishedGeneration, { recursive: true, force: true });
       const restore = this.db.transaction(() => {
         this.db.exec("DELETE FROM semantic_vectors; DELETE FROM embedding_queue;");
         const restoreVector = this.db.prepare("INSERT INTO semantic_vectors(chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)");
@@ -233,8 +251,8 @@ export class Archive {
       .filter((entry) => entry.isDirectory() && SEMANTIC_GENERATION_NAME.test(entry.name))
       .map((entry) => entry.name)
       .sort((left, right) => {
-        const leftTimestamp = Number(left.slice(left.lastIndexOf("-") + 1));
-        const rightTimestamp = Number(right.slice(right.lastIndexOf("-") + 1));
+        const leftTimestamp = this.generationTimestamp(left);
+        const rightTimestamp = this.generationTimestamp(right);
         return rightTimestamp - leftTimestamp || right.localeCompare(left);
       });
     const retained = new Set(generations.slice(0, RETAINED_SEMANTIC_GENERATIONS));
@@ -244,8 +262,14 @@ export class Archive {
     }
   }
 
+  private generationTimestamp(name: string): number {
+    const match = /^gen-[0-9a-f]{16}-([0-9]+)(?:-[0-9a-f]+)?$/.exec(name);
+    return match ? Number(match[1]) : 0;
+  }
+
   semanticGeneration(root: string): { generation: string; archiveRevision: string; vectorCount: number } {
     const generation = readFileSync(join(root, "CURRENT"), "utf8").trim();
+    if (!SEMANTIC_GENERATION_NAME.test(generation)) throw new Error("invalid semantic generation pointer");
     const manifest = JSON.parse(readFileSync(join(root, "generations", generation, "manifest.json"), "utf8")) as {
       archiveRevision: string; vectors: unknown[];
     };
@@ -352,7 +376,6 @@ export class Archive {
     }[];
     const rebuild = this.db.transaction(() => {
       this.db.exec("DELETE FROM chunks_fts");
-    for (const language of lexicalFields()) this.db.exec(`DELETE FROM chunks_fts_${language}`);
       for (const row of rows) {
         const message = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(row.message_id) as MessageRow;
         this.db.prepare(`INSERT INTO chunks_fts(rowid, subject, from_address, to_addresses, thread_subject,
@@ -362,8 +385,6 @@ export class Archive {
       }
     });
     rebuild();
-    this.db.prepare("DELETE FROM lexical_index_meta WHERE id = 1").run();
-    this.lexicalRebuildRequired = true;
     return { rows: rows.length, status: "repaired" };
   }
 

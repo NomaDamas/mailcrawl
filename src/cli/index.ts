@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
 import type { SearchFilters } from "../types.js";
@@ -25,12 +26,15 @@ program
   .option("--json")
   .action(async (options: SyncOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
+    if (options.source !== "fixture" && options.source !== "himalaya") throw new Error(`unsupported source: ${options.source}`);
+    if (options.source === "fixture" && !options.fixture) throw new Error("--fixture is required for fixture source");
+    if (options.source === "himalaya" && !options.account) throw new Error("--account is required for himalaya source");
     await mkdir(dataDir, { recursive: true });
-    const archive = new Archive(`${dataDir}/archive.sqlite`);
+    const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
       const source = options.source === "fixture"
-        ? new FixtureSource(options.fixture!)
-        : new HimalayaSource(options.account!, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
+        ? fixtureSource(options)
+        : himalayaSource(options);
       const excludedCategories = (options.excludeCategory.length ? options.excludeCategory : ["spam", "promotions"])
         .filter((category) => !options.includeCategory.includes(category));
       output(await archive.sync(await source.list(), { excludedCategories }), options.json);
@@ -41,11 +45,12 @@ program
 
 program
   .command("index")
+  .alias("embed")
   .option("--json")
   .action(async (options: JsonOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
-    const archive = new Archive(`${dataDir}/archive.sqlite`);
-    try { output({ ...await archive.indexSemanticGeneration(`${dataDir}/semantic`), embedder: "onnx-community/embeddinggemma-300m-ONNX" }, options.json); } finally { archive.close(); }
+    const archive = new Archive(join(dataDir, "archive.sqlite"));
+    try { output({ ...await archive.indexSemanticGeneration(join(dataDir, "semantic")), embedder: "onnx-community/embeddinggemma-300m-ONNX" }, options.json); } finally { archive.close(); }
   });
 
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
@@ -63,12 +68,10 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--json")
     .action(async (query: string, options: SearchOptions, command: Command) => {
       const dataDir = command.parent!.opts().dataDir as string;
-      const archive = new Archive(`${dataDir}/archive.sqlite`);
+      const archive = new Archive(join(dataDir, "archive.sqlite"));
       try {
-        const result = mode === "bm25"
+        const result = mode === "bm25" || mode === "keyword"
           ? await archive.searchBm25(query, filters(options), Number(options.limit))
-          : mode === "keyword"
-            ? await archive.searchBm25(query, filters(options), Number(options.limit))
           : mode === "hybrid"
             ? await archive.searchHybrid(query, filters(options), Number(options.limit))
             : await archive.searchSemantic(query, filters(options), Number(options.limit));
@@ -82,7 +85,7 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
 program
   .command("search")
   .argument("<query>")
-  .option("--mode <mode>", "keyword, bm25, semantic, hybrid", "bm25")
+  .option("--mode <mode>", "fts, keyword, bm25, semantic, hybrid", "bm25")
   .option("--account <id>")
   .option("--mailbox <name>")
   .option("--from <address>")
@@ -93,11 +96,11 @@ program
   .option("--limit <n>", "result limit", "10")
   .option("--json")
   .action(async (query: string, options: SearchOptions & { mode: string }, command: Command) => {
-    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"));
     try {
       const filter = filters(options);
       const limit = Number(options.limit);
-      const result = options.mode === "bm25" ? await archive.searchBm25(query, filter, limit)
+      const result = options.mode === "bm25" || options.mode === "fts" || options.mode === "keyword" ? await archive.searchBm25(query, filter, limit)
         : options.mode === "semantic" ? await archive.searchSemantic(query, filter, limit)
           : options.mode === "hybrid" ? await archive.searchHybrid(query, filter, limit)
             : (() => { throw new Error(`unsupported search mode: ${options.mode}`); })();
@@ -110,7 +113,7 @@ program
   .command("get <messageId>")
   .option("--json")
   .action(async (messageId: string, options: JsonOptions, command: Command) => {
-    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    const archive = new Archive(join(command.parent!.parent!.opts().dataDir, "archive.sqlite"));
     try { output(archive.getMessage(messageId) ?? null, options.json); } finally { archive.close(); }
   });
 
@@ -119,7 +122,7 @@ program
   .argument("<chunkId>")
   .option("--json")
   .action(async (chunkId: string, options: JsonOptions, command: Command) => {
-    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"));
     try { output(archive.getChunkContext(chunkId), options.json); } finally { archive.close(); }
   });
 
@@ -132,7 +135,7 @@ program
   .option("--before <date>")
   .option("--json")
   .action(async (threadId: string, options: SearchOptions, command: Command) => {
-    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    const archive = new Archive(join(command.parent!.parent!.opts().dataDir, "archive.sqlite"));
     try { output(archive.getThread(threadId, filters(options)), options.json); } finally { archive.close(); }
   });
 
@@ -142,7 +145,7 @@ program
   .option("--message <messageId>")
   .option("--json")
   .action(async (threadId: string, options: JsonOptions & { message?: string }, command: Command) => {
-    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+    const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"));
     try { output(archive.getThreadContext(threadId, options.message), options.json); } finally { archive.close(); }
   });
 
@@ -151,17 +154,17 @@ program
   .option("--json")
   .action(async (options: JsonOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
-    const archive = new Archive(`${dataDir}/archive.sqlite`);
+    const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
       let semantic: unknown = "missing";
-      try { semantic = archive.semanticGeneration(`${dataDir}/semantic`); }
-      catch (error) { semantic = redactDiagnostic({ status: "stale", error: error instanceof Error ? error.message : String(error) }); }
+      try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
+      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
       const semanticCommitted = typeof semantic === "object" && semantic !== null && "generation" in semantic;
       output({
         name: "mailcrawl",
-        archive: `${dataDir}/archive.sqlite`,
-        archivePresent: existsSync(`${dataDir}/archive.sqlite`),
-        fts: "available",
+        archive: join(dataDir, "archive.sqlite"),
+        archivePresent: existsSync(join(dataDir, "archive.sqlite")),
+        fts: archive.status().fts,
         semantic,
         recommendation: semanticCommitted ? "semantic index is committed" : "run sync, then index before semantic search",
       }, options.json);
@@ -169,14 +172,39 @@ program
   });
 
 program
+  .command("status")
+  .option("--json")
+  .action(async (options: JsonOptions, command: Command) => {
+    const dataDir = command.parent!.opts().dataDir as string;
+    const archivePath = join(dataDir, "archive.sqlite");
+    if (!existsSync(archivePath)) {
+      output({ name: "mailcrawl", archive: archivePath, archivePresent: false, messageCount: 0, chunkCount: 0, embeddingBacklog: 0, fts: { status: "missing", rows: 0 }, semantic: { status: "missing" } }, options.json);
+      return;
+    }
+    const archive = new Archive(archivePath);
+    try {
+      let semantic: unknown = "missing";
+      try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
+      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
+      output({ name: "mailcrawl", archive: archivePath, archivePresent: true, ...archive.status(), semantic }, options.json);
+    } finally { archive.close(); }
+  });
+
+program
   .command("repair")
   .option("--fts")
+  .option("--semantic")
+  .option("--all")
   .option("--json")
-  .action(async (options: JsonOptions & { fts?: boolean }, command: Command) => {
-    const archive = new Archive(`${command.parent!.opts().dataDir}/archive.sqlite`);
+  .action(async (options: JsonOptions & { fts?: boolean; semantic?: boolean; all?: boolean }, command: Command) => {
+    const dataDir = command.parent!.opts().dataDir as string;
+    const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
-      if (!options.fts) throw new Error("pass --fts");
-      output(archive.repairFts(), options.json);
+      if (!options.fts && !options.semantic && !options.all) throw new Error("pass --fts, --semantic, or --all");
+      const result: Record<string, unknown> = {};
+      if (options.semantic || options.all) result.semantic = await archive.indexSemanticGeneration(join(dataDir, "semantic"));
+      if (options.fts || options.all) result.fts = archive.repairFts();
+      output(Object.keys(result).length === 1 ? Object.values(result)[0] : result, options.json);
     } finally { archive.close(); }
   });
 
@@ -186,13 +214,13 @@ attachments
   .option("--message <messageId>")
   .option("--json")
   .action(async (options: JsonOptions & { message?: string }, command: Command) => {
-    const archive = new Archive(`${command.parent!.parent!.opts().dataDir}/archive.sqlite`);
+    const archive = new Archive(join(command.parent!.parent!.opts().dataDir, "archive.sqlite"));
     try { output(archive.listAttachments(options.message), options.json); } finally { archive.close(); }
   });
 
 program.parseAsync().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(JSON.stringify({ error: message }));
+  console.error(JSON.stringify(redactDiagnostic({ error: message })));
   process.exitCode = 1;
 });
 
@@ -201,6 +229,20 @@ interface SyncOptions extends JsonOptions { source: string; fixture?: string; ac
 interface SearchOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
+}
+function fixtureSource(options: SyncOptions): FixtureSource {
+  if (!options.fixture) throw new Error("--fixture is required for selected source");
+  return new FixtureSource(options.fixture);
+}
+function himalayaSource(options: SyncOptions): HimalayaSource {
+  if (!options.account) throw new Error("--account is required for selected source");
+  return new HimalayaSource(options.account, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
+}
+function semanticStatus(archive: Archive, semantic: { generation: string; archiveRevision: string; vectorCount: number }): object {
+  return semantic.archiveRevision === archive.status().archiveRevision ? { ...semantic, status: "healthy" } : { ...semantic, status: "stale" };
+}
+function semanticErrorStatus(error: unknown): "missing" | "corrupt" {
+  return error instanceof Error && "code" in error && error.code === "ENOENT" ? "missing" : "corrupt";
 }
 function output(value: unknown, json?: boolean): void {
   if (json) console.log(JSON.stringify(value));

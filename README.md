@@ -20,6 +20,7 @@ mailcrawl embed --json
 mailcrawl search --mode hybrid --json "계약 갱신 조건"
 mailcrawl status --json
 mailcrawl doctor --json
+mailcrawl repair --all --json
 ```
 
 The CLI owns email synchronization and indexes. Consumers such as AutoRAG,
