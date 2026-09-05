@@ -81,4 +81,32 @@ describe("CLI contract", () => {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it("search:keyword returns lexical results without semantic indexing", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mailcrawl-cli-keyword-"));
+    try {
+      await run("node", ["dist/cli/index.js", "--data-dir", dataDir, "sync", "--source", "fixture", "--fixture", "tests/fixtures/messages.json"]);
+      const result = await run("node", ["dist/cli/index.js", "--data-dir", dataDir, "search:keyword", "--json", "renewal"]);
+      const output = JSON.parse(result.stdout) as Array<{ mode: string }>;
+
+      expect(output.length).toBeGreaterThan(0);
+      expect(output.every((hit) => hit.mode === "bm25")).toBe(true);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("search --mode keyword returns lexical results without semantic indexing", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mailcrawl-cli-search-mode-keyword-"));
+    try {
+      await run("node", ["dist/cli/index.js", "--data-dir", dataDir, "sync", "--source", "fixture", "--fixture", "tests/fixtures/messages.json"]);
+      const result = await run("node", ["dist/cli/index.js", "--data-dir", dataDir, "search", "--mode", "keyword", "--json", "renewal"]);
+      const output = JSON.parse(result.stdout) as Array<{ mode: string }>;
+
+      expect(output.length).toBeGreaterThan(0);
+      expect(output.every((hit) => hit.mode === "bm25")).toBe(true);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
 });
