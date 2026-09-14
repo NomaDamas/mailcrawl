@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ClassificationPolicy, Chunk, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
+import type { ClassificationPolicy, Chunk, LoopbackHttpConfig, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { scopedId, snippet } from "./util.js";
@@ -18,8 +18,10 @@ export class Archive {
   private lexical?: LexicalAnalyzers;
   private operationTail: Promise<void> = Promise.resolve();
   private lexicalRebuildRequired: boolean;
+  private readonly embedderConfig?: LoopbackHttpConfig;
 
-  constructor(path = ":memory:") {
+  constructor(path = ":memory:", embedderConfig?: LoopbackHttpConfig) {
+    this.embedderConfig = embedderConfig;
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
@@ -177,7 +179,7 @@ export class Archive {
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
         const old = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string; model: string } | undefined;
-        if (old?.content_hash === row.content_hash && old.model === embeddingModelName()) {
+        if (old?.content_hash === row.content_hash && old.model === embeddingModelName(this.embedderConfig)) {
           completeQueueRow.run(row.chunk_id);
           reused++;
           continue;
@@ -191,7 +193,7 @@ export class Archive {
     const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
     const write = this.db.transaction(() => {
       for (const [index, row] of pending.entries()) {
-        upsert.run(row.chunk_id, row.content_hash, embeddingModelName(), JSON.stringify(vectors[index]));
+        upsert.run(row.chunk_id, row.content_hash, embeddingModelName(this.embedderConfig), JSON.stringify(vectors[index]));
         completeQueueRow.run(row.chunk_id);
         embedded++;
       }
@@ -222,7 +224,7 @@ export class Archive {
         FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id
         ORDER BY v.chunk_id`).all();
       writeFileSync(join(staging, "manifest.json"), JSON.stringify({
-        archiveRevision: this.revision(), vectors, model: embeddingModelName(),
+        archiveRevision: this.revision(), vectors, model: embeddingModelName(this.embedderConfig),
       }));
       renameSync(staging, publishedGeneration);
       published = true;
@@ -475,7 +477,7 @@ export class Archive {
   }
 
   private async getEmbedder(): Promise<Embedder> {
-    this.embedder ??= await createEmbedder();
+    this.embedder ??= await createEmbedder(this.embedderConfig);
     return this.embedder;
   }
 
