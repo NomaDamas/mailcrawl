@@ -7,6 +7,8 @@ import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
 import type { SearchFilters } from "../types.js";
 import { redactDiagnostic } from "../redact.js";
+import type { LoopbackHttpConfig } from "../types.js";
+import { embeddingModelName, loopbackConfigFromEnvironment } from "../embedding.js";
 
 const program = new Command();
 program.name("mailcrawl").description("Local privacy-first email indexing CLI");
@@ -46,11 +48,19 @@ program
 program
   .command("index")
   .alias("embed")
+  .option("--provider <provider>", "embedding provider", "local")
+  .option("--embed-url <url>")
+  .option("--embed-model <model>")
+  .option("--embed-dim <n>")
+  .option("--query-prefix <prefix>")
+  .option("--passage-prefix <prefix>")
+  .option("--embed-timeout <ms>")
   .option("--json")
-  .action(async (options: JsonOptions, command: Command) => {
+  .action(async (options: EmbedOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
-    const archive = new Archive(join(dataDir, "archive.sqlite"));
-    try { output({ ...await archive.indexSemanticGeneration(join(dataDir, "semantic")), embedder: "onnx-community/embeddinggemma-300m-ONNX" }, options.json); } finally { archive.close(); }
+    const config = embedderConfig(options);
+    const archive = new Archive(join(dataDir, "archive.sqlite"), config);
+    try { output({ ...await archive.indexSemanticGeneration(join(dataDir, "semantic")), embedder: embeddingModelName(config) }, options.json); } finally { archive.close(); }
   });
 
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
@@ -65,10 +75,17 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--after <date>")
     .option("--before <date>")
     .option("--limit <n>", "result limit", "10")
+    .option("--provider <provider>", "embedding provider", "local")
+    .option("--embed-url <url>")
+    .option("--embed-model <model>")
+    .option("--embed-dim <n>")
+    .option("--query-prefix <prefix>")
+    .option("--passage-prefix <prefix>")
+    .option("--embed-timeout <ms>")
     .option("--json")
     .action(async (query: string, options: SearchOptions, command: Command) => {
       const dataDir = command.parent!.opts().dataDir as string;
-      const archive = new Archive(join(dataDir, "archive.sqlite"));
+      const archive = new Archive(join(dataDir, "archive.sqlite"), embedderConfig(options));
       try {
         const result = mode === "bm25" || mode === "keyword"
           ? await archive.searchBm25(query, filters(options), Number(options.limit))
@@ -94,9 +111,16 @@ program
   .option("--after <date>")
   .option("--before <date>")
   .option("--limit <n>", "result limit", "10")
+  .option("--provider <provider>", "embedding provider", "local")
+  .option("--embed-url <url>")
+  .option("--embed-model <model>")
+  .option("--embed-dim <n>")
+  .option("--query-prefix <prefix>")
+  .option("--passage-prefix <prefix>")
+  .option("--embed-timeout <ms>")
   .option("--json")
   .action(async (query: string, options: SearchOptions & { mode: string }, command: Command) => {
-    const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"));
+    const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"), embedderConfig(options));
     try {
       const filter = filters(options);
       const limit = Number(options.limit);
@@ -195,14 +219,26 @@ program
   .option("--fts")
   .option("--semantic")
   .option("--all")
+  .option("--provider <provider>", "embedding provider", "local")
+  .option("--embed-url <url>")
+  .option("--embed-model <model>")
+  .option("--embed-dim <n>")
+  .option("--query-prefix <prefix>")
+  .option("--passage-prefix <prefix>")
+  .option("--embed-timeout <ms>")
   .option("--json")
-  .action(async (options: JsonOptions & { fts?: boolean; semantic?: boolean; all?: boolean }, command: Command) => {
+  .action(async (options: EmbedOptions & { fts?: boolean; semantic?: boolean; all?: boolean }, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
       if (!options.fts && !options.semantic && !options.all) throw new Error("pass --fts, --semantic, or --all");
       const result: Record<string, unknown> = {};
-      if (options.semantic || options.all) result.semantic = await archive.indexSemanticGeneration(join(dataDir, "semantic"));
+      if (options.semantic || options.all) {
+        const config = embedderConfig(options);
+        const semanticArchive = config ? new Archive(join(dataDir, "archive.sqlite"), config) : archive;
+        try { result.semantic = await semanticArchive.indexSemanticGeneration(join(dataDir, "semantic")); }
+        finally { if (semanticArchive !== archive) semanticArchive.close(); }
+      }
       if (options.fts || options.all) result.fts = archive.repairFts();
       output(Object.keys(result).length === 1 ? Object.values(result)[0] : result, options.json);
     } finally { archive.close(); }
@@ -225,10 +261,17 @@ program.parseAsync().catch((error: unknown) => {
 });
 
 interface JsonOptions { json?: boolean }
+interface EmbedOptions extends JsonOptions { provider: string; embedUrl?: string; embedModel?: string; embedDim?: string; queryPrefix?: string; passagePrefix?: string; embedTimeout?: string }
 interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
-interface SearchOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
+interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
+}
+function embedderConfig(options: EmbedOptions): LoopbackHttpConfig | undefined {
+  if (options.provider === "local") return loopbackConfigFromEnvironment();
+  if (options.provider !== "loopback-http") throw new Error(`unsupported embedding provider: ${options.provider}`);
+  if (!options.embedUrl || !options.embedModel || !options.embedDim) throw new Error("--embed-url, --embed-model, and --embed-dim are required for loopback-http");
+  return { provider: "loopback-http", url: options.embedUrl, model: options.embedModel, dimension: Number(options.embedDim), queryPrefix: options.queryPrefix, passagePrefix: options.passagePrefix, timeoutMs: options.embedTimeout ? Number(options.embedTimeout) : undefined };
 }
 function fixtureSource(options: SyncOptions): FixtureSource {
   if (!options.fixture) throw new Error("--fixture is required for selected source");

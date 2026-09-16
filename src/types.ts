@@ -1,5 +1,17 @@
 export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
 
+export type EmbedderProvider = "local" | "loopback-http";
+
+export interface LoopbackHttpConfig {
+  provider: "loopback-http";
+  url: string;
+  model: string;
+  dimension: number;
+  queryPrefix?: string;
+  passagePrefix?: string;
+  timeoutMs?: number;
+}
+
 export interface MailMessage {
   accountId: string;
   mailbox: string;

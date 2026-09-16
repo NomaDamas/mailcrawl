@@ -57,6 +57,21 @@ Chinese helper builds, environment variables, smoke tests, and license
 requirements, follow [`docs/multilingual-installation.md`](docs/multilingual-installation.md)
 before using multilingual indexing or search.
 
+## Shared loopback embedding provider
+
+The local in-process model is the default. Opt into a local HTTP runtime with
+`--provider loopback-http`, `--embed-url`, `--embed-model`, and `--embed-dim`
+on `index`, `repair --semantic`, or semantic search. Only HTTP URLs for
+`127.0.0.1`, `localhost`, or `::1` are accepted. Query/passage prefixes and
+timeout are optional and are included in the provider identity. Any provider
+setting change rebuilds vectors, while a failed rebuild preserves the prior
+`CURRENT` generation.
+
+The equivalent environment contract is
+`MAILCRAWL_EMBEDDER_PROVIDER`, `MAILCRAWL_EMBED_URL`,
+`MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`, `MAILCRAWL_QUERY_PREFIX`,
+`MAILCRAWL_PASSAGE_PREFIX`, and `MAILCRAWL_EMBED_TIMEOUT`.
+
 ## Releasing
 
 GitHub Release `vX.Y.Z` (must match `package.json`) publishes `@nomadamas/mailcrawl` to npm with OIDC trusted publishing. No `NPM_TOKEN` is stored in GitHub.
