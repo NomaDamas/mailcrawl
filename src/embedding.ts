@@ -47,7 +47,8 @@ class TestEmbedder implements Embedder {
 class LoopbackHttpEmbedder implements Embedder {
   constructor(private readonly config: LoopbackHttpConfig) {
     const url = new URL(config.url);
-    if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
+    const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname;
+    if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "::1"].includes(hostname)) {
       throw new Error("loopback HTTP embedding URL is required");
     }
     if (!Number.isInteger(config.dimension) || config.dimension <= 0) throw new Error("embedding dimension must be positive");

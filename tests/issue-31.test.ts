@@ -8,12 +8,14 @@ import { createEmbedder, embeddingModelName } from "../src/embedding.js";
 
 describe("issue #31 loopback HTTP embedding provider", () => {
   it("accepts loopback URLs and rejects remote URLs", async () => {
-    await expect(createEmbedder({
-      provider: "loopback-http",
-      url: "http://127.0.0.1:4318/embed",
-      model: "test-model",
-      dimension: 3,
-    })).resolves.toBeDefined();
+    for (const url of ["http://127.0.0.1:4318/embed", "http://localhost:4318/embed", "http://[::1]:4318/embed"]) {
+      await expect(createEmbedder({
+        provider: "loopback-http",
+        url,
+        model: "test-model",
+        dimension: 3,
+      })).resolves.toBeDefined();
+    }
     await expect(createEmbedder({
       provider: "loopback-http",
       url: "https://example.com/embed",
