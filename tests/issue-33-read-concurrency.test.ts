@@ -105,6 +105,75 @@ describe("issue #33 bounded Himalaya reads", () => {
     expect(peak).toBe(4);
   });
 
+  it("stops dispatching page reads after a worker failure", async () => {
+    const items = Array.from({ length: 40 }, (_, index) => index);
+    const started: number[] = [];
+    const run = mapWithConcurrency(items, 4, async (item) => {
+      started.push(item);
+      if (item === 0) throw new Error("boom");
+      return item;
+    });
+
+    await expect(run).rejects.toThrow("boom");
+    expect(started).toEqual([0, 1, 2, 3]);
+
+    // The in-flight workers must exit instead of consuming the rest of the
+    // page; a macrotask drains any leaked microtask cascade first.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(started).toEqual([0, 1, 2, 3]);
+  });
+
+  it("retries a transient read failure with growing backoff until it succeeds", async () => {
+    const attempts = new Map<string, number>();
+    const attemptTimes: number[] = [];
+    const transient = (id: string) => Object.assign(new Error(`Command failed: himalaya -a stub --json message read ${id} --raw`), {
+      stderr: "FETCH returned no body for the requested message",
+    });
+    const source = new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      concurrency: 4,
+      retryAttempts: 3,
+      retryBaseDelayMs: 60,
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes: stubEnvelopes(12) }) };
+        const id = args[args.indexOf("read") + 1];
+        const attempt = (attempts.get(id) ?? 0) + 1;
+        attempts.set(id, attempt);
+        if (id === "7") {
+          attemptTimes.push(Date.now());
+          if (attempt < 3) throw transient(id);
+        }
+        return { stdout: JSON.stringify({ message: `raw mime ${id}` }) };
+      },
+    });
+
+    const messages = await source.list();
+
+    expect(messages).toHaveLength(12);
+    expect(attempts.get("7")).toBe(3);
+    expect(attemptTimes).toHaveLength(3);
+    // 60ms before the second attempt and 120ms before the third; lower bounds
+    // only, so a slow machine can stretch the gaps but never shrink them.
+    expect(attemptTimes[1] - attemptTimes[0]).toBeGreaterThanOrEqual(50);
+    expect(attemptTimes[2] - attemptTimes[1]).toBeGreaterThanOrEqual(100);
+  });
+
+  posixOnly("retries a transiently failing read until it succeeds", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-retry-"));
+    const handle = prepareStub(root);
+    try {
+      const messages = await withStubEnvironment(
+        handle,
+        { MC_STUB_COUNT: "12", MC_STUB_LIMIT: "4", MC_STUB_READ_DELAY_MS: "40", MC_STUB_FAIL_ONCE: "7:2" },
+        () => new HimalayaSource("stub", "INBOX").list());
+
+      expect(messages.map((message) => message.providerKey)).toEqual(Array.from({ length: 12 }, (_, index) => String(index + 1)));
+      expect(attemptsFor(handle.stateDir, "7")).toBe(3);
+      expect(lines(join(handle.stateDir, "throttled.log"))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  }, 60_000);
+
   posixOnly("reads a page with a bounded pool instead of one process per envelope", async () => {
     const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-pool-"));
     const handle = prepareStub(root);

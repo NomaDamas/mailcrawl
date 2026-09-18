@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
-import type { MailMessage } from "./types.js";
+import type { MailMessage, SourceReadFailure } from "./types.js";
 import { redactDiagnostic } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
@@ -9,12 +9,22 @@ const execFileAsync = promisify(execFile);
 /** Default number of simultaneous `himalaya message read` processes. */
 export const DEFAULT_READ_CONCURRENCY = 4;
 
+/** Default number of attempts per message read, including the first one. */
+export const DEFAULT_RETRY_ATTEMPTS = 3;
+
+/** Default backoff before the second read attempt; doubles per round. */
+export const DEFAULT_RETRY_BASE_DELAY_MS = 250;
+
 /** Executes one himalaya invocation; replaced by tests. */
 export type HimalayaExec = (args: string[], maxBuffer: number) => Promise<{ stdout: string; stderr?: string }>;
 
 export interface HimalayaReadOptions {
   /** Simultaneous message reads; defaults to DEFAULT_READ_CONCURRENCY. */
   concurrency?: number;
+  /** Attempts per message read, including the first one; defaults to DEFAULT_RETRY_ATTEMPTS. */
+  retryAttempts?: number;
+  /** Backoff before the second attempt, doubling per round; defaults to DEFAULT_RETRY_BASE_DELAY_MS. */
+  retryBaseDelayMs?: number;
   exec?: HimalayaExec;
 }
 
@@ -42,11 +52,43 @@ export class HimalayaSource implements MailSource {
   ) {}
 
   async list(): Promise<MailMessage[]> {
-    const envelopes = await this.envelopes();
-    return mapWithConcurrency(envelopes, this.concurrency, async (envelope) => {
-      const providerKey = envelopeKey(envelope);
-      return envelopeMessage(this.account, this.mailbox, envelope, providerKey, await this.read(providerKey));
+    const { messages, failures } = await this.readPage(await this.envelopes());
+    if (failures.length > 0) throw new Error(failures[0].error);
+    return messages;
+  }
+
+  /** Reads a page through a bounded pool, retrying failed reads in later rounds. */
+  private async readPage(envelopes: HimalayaEnvelope[]): Promise<{ messages: MailMessage[]; failures: SourceReadFailure[] }> {
+    const keys = envelopes.map(envelopeKey);
+    const rawMime = new Map<number, string>();
+    const errors = new Map<number, Error>();
+    const attempts = Math.max(1, Math.floor(this.readOptions.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS));
+    const baseDelayMs = Math.max(0, this.readOptions.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS);
+    let pending = envelopes.map((_, index) => index);
+    for (let attempt = 1; attempt <= attempts && pending.length > 0; attempt += 1) {
+      if (attempt > 1) await delay(baseDelayMs * 2 ** (attempt - 2));
+      const failed: number[] = [];
+      await mapWithConcurrency(pending, this.concurrency, async (index) => {
+        try {
+          rawMime.set(index, await this.read(keys[index]));
+        } catch (error) {
+          errors.set(index, error instanceof Error ? error : new Error(String(error)));
+          failed.push(index);
+        }
+      });
+      pending = failed;
+    }
+    const messages: MailMessage[] = [];
+    const failures: SourceReadFailure[] = [];
+    envelopes.forEach((envelope, index) => {
+      const raw = rawMime.get(index);
+      if (raw !== undefined) {
+        messages.push(envelopeMessage(this.account, this.mailbox, envelope, keys[index], raw));
+        return;
+      }
+      failures.push({ providerKey: keys[index], attempts, error: (errors.get(index) ?? new Error("message read failed")).message });
     });
+    return { messages, failures };
   }
 
   private get concurrency(): number {
@@ -84,12 +126,20 @@ export class HimalayaSource implements MailSource {
 export async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let cursor = 0;
+  let stopped = false;
   const width = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
   await Promise.all(Array.from({ length: width }, async () => {
-    while (true) {
+    while (!stopped) {
       const index = cursor++;
       if (index >= items.length) return;
-      results[index] = await worker(items[index]);
+      try {
+        results[index] = await worker(items[index]);
+      } catch (error) {
+        // A failed page must not keep spawning provider processes for the
+        // items that were never read; only the in-flight workers finish.
+        stopped = true;
+        throw error;
+      }
     }
   }));
   return results;
@@ -97,6 +147,10 @@ export async function mapWithConcurrency<T, R>(items: readonly T[], limit: numbe
 
 function envelopeKey(envelope: HimalayaEnvelope): string {
   return String(envelope.id ?? envelope.uid ?? envelope["message-id"]);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function envelopeMessage(account: string, mailbox: string, envelope: HimalayaEnvelope, providerKey: string, rawMime: string): MailMessage {

@@ -107,6 +107,12 @@ export interface SyncReport {
   excludedByReason: Record<string, number>;
 }
 
+export interface SourceReadFailure {
+  providerKey: string;
+  attempts: number;
+  error: string;
+}
+
 export interface ClassificationPolicy {
   excludedCategories?: string[];
 }
