@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
-import type { MailMessage, SourceReadFailure } from "./types.js";
+import type { MailMessage, SourceReadFailure, SourceReadResult } from "./types.js";
 import { redactDiagnostic } from "./redact.js";
 
 const execFileAsync = promisify(execFile);
@@ -29,11 +29,18 @@ export interface HimalayaReadOptions {
 }
 
 export interface MailSource {
+  /** Messages that could be read, plus one record per message that could not. */
+  collect(): Promise<SourceReadResult>;
+  /** Strict variant of `collect()`: rejects when any message could not be read. */
   list(): Promise<MailMessage[]>;
 }
 
 export class FixtureSource implements MailSource {
   constructor(private readonly path: string) {}
+
+  async collect(): Promise<SourceReadResult> {
+    return { messages: await this.list(), failures: [] };
+  }
 
   async list(): Promise<MailMessage[]> {
     const raw = await readFile(this.path, "utf8");
@@ -51,14 +58,18 @@ export class HimalayaSource implements MailSource {
     private readonly readOptions: HimalayaReadOptions = {},
   ) {}
 
+  async collect(): Promise<SourceReadResult> {
+    return this.readPage(await this.envelopes());
+  }
+
   async list(): Promise<MailMessage[]> {
-    const { messages, failures } = await this.readPage(await this.envelopes());
+    const { messages, failures } = await this.collect();
     if (failures.length > 0) throw new Error(failures[0].error);
     return messages;
   }
 
   /** Reads a page through a bounded pool, retrying failed reads in later rounds. */
-  private async readPage(envelopes: HimalayaEnvelope[]): Promise<{ messages: MailMessage[]; failures: SourceReadFailure[] }> {
+  private async readPage(envelopes: HimalayaEnvelope[]): Promise<SourceReadResult> {
     const keys = envelopes.map(envelopeKey);
     const rawMime = new Map<number, string>();
     const errors = new Map<number, Error>();
@@ -178,8 +189,17 @@ async function runHimalaya(args: string[], maxBuffer: number, operation: string,
     return await (exec ?? defaultExec)(args, maxBuffer);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`himalaya ${operation} failed: ${redactDiagnostic(detail)}`);
+    throw new Error(`himalaya ${operation} failed: ${redactDiagnostic(detail)}${stderrDetail(error)}`);
   }
+}
+
+/** Keeps himalaya's own stderr in the surfaced error so throttling is distinguishable from a malformed message. */
+function stderrDetail(error: unknown): string {
+  const stderr = (error as { stderr?: unknown } | null | undefined)?.stderr;
+  if (typeof stderr !== "string") return "";
+  const text = stderr.trim();
+  if (!text) return "";
+  return `: ${String(redactDiagnostic(text.length > 2_000 ? `${text.slice(0, 2_000)} [truncated]` : text))}`;
 }
 
 const defaultExec: HimalayaExec = (args, maxBuffer) => execFileAsync("himalaya", args, { maxBuffer });

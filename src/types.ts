@@ -113,6 +113,11 @@ export interface SourceReadFailure {
   error: string;
 }
 
+export interface SourceReadResult {
+  messages: MailMessage[];
+  failures: SourceReadFailure[];
+}
+
 export interface ClassificationPolicy {
   excludedCategories?: string[];
 }

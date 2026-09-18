@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -41,6 +42,21 @@ function lines(path: string): string[] {
 
 function observedCounts(stateDir: string): number[] {
   return lines(join(stateDir, "observed.log")).map((line) => Number(line.split(" ")[1]));
+}
+
+function stubEnv(handle: StubHandle, variables: Record<string, string>): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    MAILCRAWL_EMBEDDER: "mock",
+    PATH: `${handle.binDir}${delimiter}${process.env.PATH ?? ""}`,
+    MC_STUB_DIR: handle.stateDir,
+    ...variables,
+  };
+}
+
+function runCli(dataDir: string, args: string[], env: NodeJS.ProcessEnv): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(process.execPath, ["dist/cli/index.js", "--data-dir", dataDir, ...args], { encoding: "utf8", env });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 function attemptsFor(stateDir: string, id: string): number {
@@ -174,6 +190,34 @@ describe("issue #33 bounded Himalaya reads", () => {
     }
   }, 60_000);
 
+  it("syncs the messages it could read and reports the failures with himalaya stderr", async () => {
+    const attempts = new Map<string, number>();
+    const source = new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      concurrency: 4,
+      retryAttempts: 3,
+      retryBaseDelayMs: 5,
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes: stubEnvelopes(12) }) };
+        const id = args[args.indexOf("read") + 1];
+        attempts.set(id, (attempts.get(id) ?? 0) + 1);
+        if (id === "9") {
+          throw Object.assign(new Error(`Command failed: himalaya -a stub --json message read ${id} --raw`), {
+            stderr: "FETCH returned no body for the requested message",
+          });
+        }
+        return { stdout: JSON.stringify({ message: `raw mime ${id}` }) };
+      },
+    });
+
+    const result = await source.collect();
+
+    expect(result.messages.map((message) => message.providerKey)).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "10", "11", "12"]);
+    expect(attempts.get("9")).toBe(3);
+    expect(result.failures).toEqual([
+      { providerKey: "9", attempts: 3, error: expect.stringContaining("FETCH returned no body for the requested message") },
+    ]);
+  });
+
   posixOnly("reads a page with a bounded pool instead of one process per envelope", async () => {
     const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-pool-"));
     const handle = prepareStub(root);
@@ -187,6 +231,77 @@ describe("issue #33 bounded Himalaya reads", () => {
     } finally {
       // Stub processes that were already spawned keep writing slot files until
       // they exit, so the removal needs Node's built-in retry.
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  }, 60_000);
+});
+
+describe("issue #33 sync CLI contract", () => {
+  it("rejects an invalid --concurrency before reading the mailbox", () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-cli-invalid-"));
+    try {
+      const result = runCli(join(root, "data"), ["sync", "--source", "himalaya", "--account", "stub", "--concurrency", "0", "--json"], { ...process.env });
+
+      expect(result.status).not.toBe(0);
+      expect(JSON.parse(result.stderr).error).toContain("--concurrency must be a positive integer");
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  posixOnly("syncs readable messages, reports failures, and exits zero", () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-cli-partial-"));
+    const handle = prepareStub(root);
+    const dataDir = join(root, "data");
+    try {
+      const variables = { MC_STUB_COUNT: "12", MC_STUB_FAIL_ALWAYS: "9", MC_STUB_READ_DELAY_MS: "40" };
+      const sync = runCli(dataDir, ["sync", "--source", "himalaya", "--account", "stub", "--mailbox", "INBOX", "--page-size", "12", "--json"], stubEnv(handle, variables));
+
+      expect(sync.status).toBe(0);
+      expect(JSON.parse(sync.stdout)).toMatchObject({
+        added: 11,
+        failures: [{ providerKey: "9", attempts: 3, error: expect.stringContaining("FETCH returned no body for the requested message") }],
+      });
+      expect(JSON.parse(runCli(dataDir, ["status", "--json"], { ...process.env }).stdout)).toMatchObject({ archivePresent: true, messageCount: 11 });
+
+      // A second bounded run only re-reads the same page and stays incremental.
+      const rerun = runCli(dataDir, ["sync", "--source", "himalaya", "--account", "stub", "--page-size", "12", "--concurrency", "2", "--json"], stubEnv(handle, variables));
+      expect(rerun.status).toBe(0);
+      expect(JSON.parse(rerun.stdout)).toMatchObject({ added: 0, unchanged: 11 });
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  }, 60_000);
+
+  posixOnly("exits nonzero only when nothing could be read", () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-cli-failed-"));
+    const handle = prepareStub(root);
+    const dataDir = join(root, "data");
+    try {
+      const sync = runCli(dataDir, ["sync", "--source", "himalaya", "--account", "stub", "--page-size", "6", "--concurrency", "2", "--json"], stubEnv(handle, {
+        MC_STUB_COUNT: "6",
+        MC_STUB_FAIL_ALWAYS: "1,2,3,4,5,6",
+        MC_STUB_READ_DELAY_MS: "30",
+      }));
+
+      expect(sync.status).not.toBe(0);
+      expect(JSON.parse(sync.stderr).error).toContain("no messages could be read");
+      expect(JSON.parse(runCli(dataDir, ["status", "--json"], { ...process.env }).stdout)).toMatchObject({ messageCount: 0 });
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  }, 60_000);
+
+  posixOnly("keeps an empty page a successful sync", () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-cli-empty-"));
+    const handle = prepareStub(root);
+    const dataDir = join(root, "data");
+    try {
+      const sync = runCli(dataDir, ["sync", "--source", "himalaya", "--account", "stub", "--page-size", "12", "--concurrency", "4", "--json"], stubEnv(handle, { MC_STUB_COUNT: "0" }));
+
+      expect(sync.status).toBe(0);
+      expect(JSON.parse(sync.stdout)).toMatchObject({ added: 0, failures: [] });
+    } finally {
       rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }, 60_000);
