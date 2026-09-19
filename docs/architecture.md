@@ -158,12 +158,18 @@ All commands support `--json` where machine-readable output is useful.
 ```text
 mailcrawl doctor
 mailcrawl status
-mailcrawl sync
+mailcrawl sync [--page-size N] [--concurrency N]
 mailcrawl embed
 mailcrawl search --mode fts|bm25|keyword|semantic|hybrid [--limit N] [--mailbox NAME] QUERY
 mailcrawl message get MESSAGE_ID
 mailcrawl repair [--fts|--semantic|--all]
 ```
+
+`--page-size` is the IMAP envelope window and `--concurrency` is the number of
+simultaneous message reads (default 4). Reads run through that bounded pool,
+failures are retried with backoff, and the messages that could be read are
+synced even when some reads keep failing, so a throttled provider no longer
+aborts a whole page.
 
 Example sync response:
 
@@ -175,9 +181,14 @@ Example sync response:
   "unchanged": 4821,
   "chunksAdded": 21,
   "chunksDeleted": 6,
-  "embeddingBacklog": 21
+  "embeddingBacklog": 21,
+  "failures": []
 }
 ```
+
+Each entry of `failures` carries the `providerKey`, the `attempts` spent on it,
+and the redacted himalaya error (including himalaya's own stderr). The command
+exits non-zero only when nothing could be read.
 
 Example search hit:
 

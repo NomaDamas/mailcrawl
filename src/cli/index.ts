@@ -22,6 +22,7 @@ program
   .option("--mailbox <name>", "mailbox name", "INBOX")
   .option("--backend <name>")
   .option("--page-size <n>", "envelopes per page", "1000")
+  .option("--concurrency <n>", "simultaneous message reads (default 4)")
   .option("--himalaya-config <path>")
   .option("--include-category <name>", "include a normally excluded category", collect, [])
   .option("--exclude-category <name>", "exclude a classification category", collect, [])
@@ -39,7 +40,11 @@ program
         : himalayaSource(options);
       const excludedCategories = (options.excludeCategory.length ? options.excludeCategory : ["spam", "promotions"])
         .filter((category) => !options.includeCategory.includes(category));
-      output(await archive.sync(await source.list(), { excludedCategories }), options.json);
+      const { messages, failures } = await source.collect();
+      if (messages.length === 0 && failures.length > 0) {
+        throw new Error(`source read failed for all ${failures.length} message(s); no messages could be read: ${failures.slice(0, 3).map((failure) => failure.providerKey).join(", ")}`);
+      }
+      output({ ...await archive.sync(messages, { excludedCategories }), failures }, options.json);
     } finally {
       archive.close();
     }
@@ -262,7 +267,7 @@ program.parseAsync().catch((error: unknown) => {
 
 interface JsonOptions { json?: boolean }
 interface EmbedOptions extends JsonOptions { provider: string; embedUrl?: string; embedModel?: string; embedDim?: string; queryPrefix?: string; passagePrefix?: string; embedTimeout?: string }
-interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
+interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; concurrency?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
 interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
@@ -279,7 +284,18 @@ function fixtureSource(options: SyncOptions): FixtureSource {
 }
 function himalayaSource(options: SyncOptions): HimalayaSource {
   if (!options.account) throw new Error("--account is required for selected source");
-  return new HimalayaSource(options.account, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig);
+  return new HimalayaSource(options.account, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig, {
+    concurrency: readConcurrency(options),
+  });
+}
+
+function readConcurrency(options: SyncOptions): number | undefined {
+  if (options.concurrency === undefined) return undefined;
+  const concurrency = Number(options.concurrency);
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error(`--concurrency must be a positive integer: ${options.concurrency}`);
+  }
+  return concurrency;
 }
 function semanticStatus(archive: Archive, semantic: { generation: string; archiveRevision: string; vectorCount: number }): object {
   return semantic.archiveRevision === archive.status().archiveRevision ? { ...semantic, status: "healthy" } : { ...semantic, status: "stale" };

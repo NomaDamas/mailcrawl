@@ -50,6 +50,21 @@ before multilingual search; the command re-analyzes existing messages and
 atomically records the new fingerprint. Embedding model changes are independent
 and require a new `mailcrawl index` generation.
 
+## Sync read concurrency
+
+`mailcrawl sync` reads a page of envelopes through a bounded pool of himalaya
+processes — 4 by default, `--concurrency <n>` to change it — instead of
+spawning one process per envelope. Gmail throttles accounts that open too many
+simultaneous IMAP connections, and an unbounded fan-out made one throttled
+read abort the entire sync. `--page-size` still controls only how many
+envelopes the IMAP window returns.
+
+A read that fails is retried with exponential backoff (three attempts by
+default). Messages that stay unreadable are reported in the sync JSON as
+`failures[]` with their `providerKey`, `attempts`, and the redacted himalaya
+error, while the messages that could be read are still synced. The command
+exits non-zero only when nothing could be read.
+
 ## Installation
 
 For the required Node setup, Kiwi model files, Go installation, Japanese and
