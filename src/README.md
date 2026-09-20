@@ -17,8 +17,9 @@ boundaries. They intentionally contain no runtime code yet.
 ## Multilingual lexical analyzers
 
 Production Korean indexing uses the real `kiwi-nlp` WASM binding. The binary
-defaults to the installed package. Set `MAILCRAWL_KIWI_MODEL` to a matching
-Kiwi model directory containing:
+defaults to the installed package. The matching Kiwi model is downloaded to
+the local cache on first Korean use. Set `MAILCRAWL_KIWI_MODEL` to override
+with a matching Kiwi model directory containing:
 
 For current Kiwi releases, use the complete model variant directory described
 in `docs/multilingual-installation.md`; do not mix model and WASM versions.

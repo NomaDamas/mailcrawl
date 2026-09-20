@@ -27,8 +27,9 @@ Required runtime dependencies are Node.js 24+, the package dependencies, and
 the Himalaya CLI for live synchronization. Fixture synchronization needs no
 mail account.
 
-For Korean lexical search, provide a Kiwi model directory through
-`MAILCRAWL_KIWI_MODEL`; the WASM binary is bundled by `kiwi-nlp`. Kagome has
+Korean lexical search auto-downloads the matching Kiwi model into the local
+cache on first use. `MAILCRAWL_KIWI_MODEL` remains an override for air-gapped
+or pinned setups; the WASM binary is bundled by `kiwi-nlp`. Kagome has
 no official Node binding, and GSE's referenced `gse-bind` is not available as
 a usable npm package. Therefore Japanese and Chinese lexical search use the
 repository helpers `tools/mailcrawl-ja` and `tools/mailcrawl-zh`; set

@@ -1,9 +1,10 @@
 import { KiwiBuilder, Match, type Kiwi } from "kiwi-nlp";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
-import { createRequire } from "node:module";
 import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import type { LexicalLanguage } from "./types.js";
+import { resolveKiwiModelDir, resolveKiwiWasmPath } from "./kiwi-runtime.js";
 
 export const LEXICAL_ANALYZER_VERSION = "kiwi-nlp@0.23.x+kagome-ipa-search+gse-search+arabic-light-v1";
 
@@ -59,17 +60,13 @@ class KiwiAnalyzer {
   private constructor(private readonly kiwi: Kiwi) {}
 
   static async create(): Promise<KiwiAnalyzer> {
-    const wasmPath = process.env.MAILCRAWL_KIWI_WASM
-      ?? createRequire(import.meta.url).resolve("kiwi-nlp/dist/kiwi-wasm.wasm");
-    const modelDir = process.env.MAILCRAWL_KIWI_MODEL;
-    if (!wasmPath || !modelDir) {
-      throw new Error("Korean analyzer requires MAILCRAWL_KIWI_WASM and MAILCRAWL_KIWI_MODEL");
-    }
+    const wasmPath = resolveKiwiWasmPath();
+    const modelDir = await resolveKiwiModelDir();
     const builder = await KiwiBuilder.create(wasmPath);
     const modelFiles = Object.fromEntries(
       readdirSync(modelDir, { withFileTypes: true })
         .filter((entry) => entry.isFile())
-        .map((entry) => [entry.name, readFileSync(`${modelDir}/${entry.name}`)]),
+        .map((entry) => [entry.name, readFileSync(join(modelDir, entry.name))]),
     );
     if (!Object.keys(modelFiles).length) throw new Error(`Korean Kiwi model directory is empty: ${modelDir}`);
     return new KiwiAnalyzer(await builder.build({ modelFiles, modelType: "cong", loadDefaultDict: true, loadTypoDict: true }));
