@@ -50,12 +50,42 @@ before multilingual search; the command re-analyzes existing messages and
 atomically records the new fingerprint. Embedding model changes are independent
 and require a new `mailcrawl index` generation.
 
+## Sync read concurrency
+
+`mailcrawl sync` reads a page of envelopes through a bounded pool of himalaya
+processes — 4 by default, `--concurrency <n>` to change it — instead of
+spawning one process per envelope. Gmail throttles accounts that open too many
+simultaneous IMAP connections, and an unbounded fan-out made one throttled
+read abort the entire sync. `--page-size` still controls only how many
+envelopes the IMAP window returns.
+
+A read that fails is retried with exponential backoff (three attempts by
+default). Messages that stay unreadable are reported in the sync JSON as
+`failures[]` with their `providerKey`, `attempts`, and the redacted himalaya
+error, while the messages that could be read are still synced. The command
+exits non-zero only when nothing could be read.
+
 ## Installation
 
 For the required Node setup, Kiwi model files, Go installation, Japanese and
 Chinese helper builds, environment variables, smoke tests, and license
 requirements, follow [`docs/multilingual-installation.md`](docs/multilingual-installation.md)
 before using multilingual indexing or search.
+
+## Shared loopback embedding provider
+
+The local in-process model is the default. Opt into a local HTTP runtime with
+`--provider loopback-http`, `--embed-url`, `--embed-model`, and `--embed-dim`
+on `index`, `repair --semantic`, or semantic search. Only HTTP URLs for
+`127.0.0.1`, `localhost`, or `::1` are accepted. Query/passage prefixes and
+timeout are optional and are included in the provider identity. Any provider
+setting change rebuilds vectors, while a failed rebuild preserves the prior
+`CURRENT` generation.
+
+The equivalent environment contract is
+`MAILCRAWL_EMBEDDER_PROVIDER`, `MAILCRAWL_EMBED_URL`,
+`MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`, `MAILCRAWL_QUERY_PREFIX`,
+`MAILCRAWL_PASSAGE_PREFIX`, and `MAILCRAWL_EMBED_TIMEOUT`.
 
 ## Releasing
 

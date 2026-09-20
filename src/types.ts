@@ -1,5 +1,17 @@
 export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
 
+export type EmbedderProvider = "local" | "loopback-http";
+
+export interface LoopbackHttpConfig {
+  provider: "loopback-http";
+  url: string;
+  model: string;
+  dimension: number;
+  queryPrefix?: string;
+  passagePrefix?: string;
+  timeoutMs?: number;
+}
+
 export interface MailMessage {
   accountId: string;
   mailbox: string;
@@ -93,6 +105,17 @@ export interface SyncReport {
   archiveRevision: string;
   excluded: number;
   excludedByReason: Record<string, number>;
+}
+
+export interface SourceReadFailure {
+  providerKey: string;
+  attempts: number;
+  error: string;
+}
+
+export interface SourceReadResult {
+  messages: MailMessage[];
+  failures: SourceReadFailure[];
 }
 
 export interface ClassificationPolicy {

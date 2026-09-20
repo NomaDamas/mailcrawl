@@ -64,6 +64,13 @@ command, such as a user-level cron or systemd timer. Run `sync` first and
 `index` afterward; inspect JSON exit status before handing results to an
 agent.
 
+Message reads use a bounded pool of himalaya processes (4 by default; change
+it with `--concurrency <n>`) because Gmail throttles accounts that open too
+many simultaneous IMAP connections. `--page-size` only sets the envelope
+window. A read that fails is retried with backoff, and messages that stay
+unreadable appear in the sync JSON `failures[]` while the readable messages
+are still synced; the command exits non-zero only when nothing could be read.
+
 Use a fixture for deterministic development:
 
 ```bash
