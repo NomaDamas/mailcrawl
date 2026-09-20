@@ -24,18 +24,21 @@ npm run build
 The `kiwi-nlp` package is installed by `npm install`. Its WASM binary is
 resolved automatically from the installed package.
 
-## 2. Configure the Korean Kiwi model
+## 2. Korean Kiwi model
 
-The npm package contains the Kiwi WASM engine, but the model files are
-distributed separately. Set `MAILCRAWL_KIWI_MODEL` to a directory containing
-the matching files from the same Kiwi release:
+The npm package contains the Kiwi WASM engine. On first Korean indexing or
+search, mailcrawl downloads the matching Kiwi `v0.23.0` base model into the
+local cache (`$XDG_CACHE_HOME/mailcrawl/kiwi-model/0.23.0` or
+`~/.cache/mailcrawl/kiwi-model/0.23.0`) and reuses it afterwards. This mirrors
+how EmbeddingGemma is cached on first `mailcrawl index`.
+
+`MAILCRAWL_KIWI_MODEL` remains an override for air-gapped or pinned setups.
+Point it at a directory containing the model assets for the same Kiwi release,
+usually `cong/base`:
 
 ```bash
 export MAILCRAWL_KIWI_MODEL="$HOME/.local/share/mailcrawl/kiwi-model"
 ```
-
-For Kiwi `v0.23.x`, point to the model variant directory, usually
-`cong/base`. The directory must contain the model assets for that release.
 
 ```text
 combiningRule.txt
@@ -47,6 +50,9 @@ sj.morph
 typo.dict
 ```
 
+`mailcrawl doctor --json` reports Korean analyzer readiness. `mailcrawl doctor --fix`
+provisions the model without waiting for a Korean query.
+
 To use a different WASM file:
 
 ```bash
@@ -54,9 +60,8 @@ export MAILCRAWL_KIWI_WASM="/path/to/kiwi-wasm.wasm"
 ```
 
 Older Kiwi releases may use `sj.knlm` and `skipbigram.mdl` instead. Keep the
-WASM and model files from compatible Kiwi releases. A missing model
-configuration is an error for production Korean indexing; mailcrawl does not
-silently substitute its test tokenizer.
+WASM and model files from compatible Kiwi releases. mailcrawl does not
+silently substitute its test tokenizer in production.
 
 ## 3. Install Go
 
@@ -115,6 +120,7 @@ Put the exports in the shell startup file used to run mailcrawl, or provide
 them through the service manager that launches it:
 
 ```bash
+# Optional. Korean search auto-provisions the Kiwi model when unset.
 export MAILCRAWL_KIWI_MODEL="$HOME/.local/share/mailcrawl/kiwi-model"
 export MAILCRAWL_JA_HELPER="$HOME/.local/bin/mailcrawl-ja"
 export MAILCRAWL_ZH_HELPER="$HOME/.local/bin/mailcrawl-zh"

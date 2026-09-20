@@ -7,6 +7,7 @@ import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
 import type { SearchFilters } from "../types.js";
 import { redactDiagnostic } from "../redact.js";
+import { inspectKoreanAnalyzer, resolveKiwiModelDir } from "../kiwi-runtime.js";
 
 const program = new Command();
 program.name("mailcrawl").description("Local privacy-first email indexing CLI");
@@ -152,10 +153,12 @@ program
 program
   .command("doctor")
   .option("--json")
-  .action(async (options: JsonOptions, command: Command) => {
+  .option("--fix")
+  .action(async (options: JsonOptions & { fix?: boolean }, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
+      if (options.fix) await resolveKiwiModelDir();
       let semantic: unknown = "missing";
       try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
       catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
@@ -166,6 +169,7 @@ program
         archivePresent: existsSync(join(dataDir, "archive.sqlite")),
         fts: archive.status().fts,
         semantic,
+        korean: inspectKoreanAnalyzer(),
         recommendation: semanticCommitted ? "semantic index is committed" : "run sync, then index before semantic search",
       }, options.json);
     } finally { archive.close(); }
