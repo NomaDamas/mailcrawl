@@ -90,6 +90,8 @@ export class Archive {
     const store = await this.findStore();
     const identity = store?.readIdentity();
     if (!identity) {
+      const stored = store ? await store.countRows() : 0;
+      if (stored > 0) return { status: "rebuild-required", ...base, vectorCount: stored };
       const status = stats.embeddingBacklog > 0 ? (stats.vectorCount > 0 ? "interrupted" : "never-completed") : "missing";
       return { status, ...base };
     }
@@ -204,10 +206,11 @@ export class Archive {
     const store = await this.getStore();
     let rebuilt = false;
     const existingIdentity = store.readIdentity();
-    if (rebuild || (existingIdentity && !sameEmbedder(existingIdentity, expected))) {
-      // Identity is data: a mismatch (or an explicit rebuild) discards the
-      // vector table and re-embeds everything. Never silent reuse.
-      if (existingIdentity || rebuild) {
+    const orphanedTable = !existingIdentity && (await store.countRows()) > 0;
+    if (rebuild || orphanedTable || (existingIdentity && !sameEmbedder(existingIdentity, expected))) {
+      // Identity is data: a mismatch, a missing sidecar next to existing
+      // vectors, or an explicit rebuild discards the table. Never silent reuse.
+      if (existingIdentity || rebuild || orphanedTable) {
         await store.drop();
         rebuilt = true;
       }

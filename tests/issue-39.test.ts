@@ -205,6 +205,29 @@ describe("issue #39: embedder identity is data", () => {
     }
   });
 
+  it("rebuilds when the identity sidecar is missing next to an existing vector table", async () => {
+    recorder.callSizes = [];
+    recorder.failAfterCall = Number.POSITIVE_INFINITY;
+    const dataDir = mkdtempSync(join(tmpdir(), "mailcrawl-issue-39-missing-identity-"));
+    let archive = new Archive(join(dataDir, "archive.sqlite"), { provider: "mock" });
+    try {
+      await archive.sync([message(0, "orphaned identity content")]);
+      expect(await archive.indexSemantic()).toMatchObject({ embedded: 1, reused: 0 });
+      archive.close();
+
+      rmSync(identityFile(dataDir));
+      expect(existsSync(join(dataDir, "semantic.lance"))).toBe(true);
+
+      archive = new Archive(join(dataDir, "archive.sqlite"), { provider: "mock" });
+      expect(await archive.semanticSummary()).toMatchObject({ status: "rebuild-required" });
+      expect(await archive.indexSemantic()).toMatchObject({ rebuilt: true, embedded: 1, reused: 0 });
+      expect(JSON.parse(readFileSync(identityFile(dataDir), "utf8"))).toMatchObject({ provider: "mock", dimension: 128 });
+    } finally {
+      archive.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses to query a vector table built by a different embedder", async () => {
     recorder.failAfterCall = Number.POSITIVE_INFINITY;
     const dataDir = mkdtempSync(join(tmpdir(), "mailcrawl-issue-39-mismatch-"));
