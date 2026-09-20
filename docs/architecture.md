@@ -61,6 +61,8 @@ reconciliation:
     chunks_fts (FTS5)
   vectors/
     LanceDB tables keyed by chunk_id and embedding_model
+  semantic.lance/           # LanceDB vector table (rebuildable)
+  semantic.identity.json    # embedder identity persisted next to the table
 ```
 
 SQLite is the source of truth for message/chunk metadata, synchronization
@@ -124,25 +126,31 @@ Search results return stable chunk and message identifiers.
 
 ### Semantic
 
-Only normalized, non-empty chunks enter the embedding queue. Each vector row
-stores:
+Only normalized, non-empty chunks enter the embedding queue. Vectors live in
+a LanceDB table at `<data-dir>/semantic.lance` — a typed
+`FixedSizeList<Float32>` vector column with account/mailbox/thread/date
+predicate columns — not as JSON text in SQLite. SQLite stays the source of
+truth for messages, chunks, and FTS; the Lance table is a rebuildable semantic
+index. Account, mailbox, thread, sender, and date filters are pushed down as
+Lance SQL predicates; the `to` filter is applied during SQLite hydration.
 
-```text
-chunk_id
-message_id
-thread_id
-embedding_model
-content_hash
-created_at
-```
+The embedder identity (provider, model, dimension, prefixes, runtime build)
+is persisted next to the table in `<data-dir>/semantic.identity.json`.
+Identity is data: a mismatch discards the vector table and re-embeds
+everything on the next index run, and search against a mismatched table fails
+loudly instead of silently scoring across embedding spaces.
 
-Changing the embedding model creates a new semantic generation. A failed
-embedding job must not make FTS unavailable.
+Indexing pages chunks in small configurable batches and commits each batch
+(vector upsert plus queue completion), so a crash resumes from the queue
+instead of restarting from zero. A failed embedding job must not make FTS
+unavailable.
 
-The default implementation uses Google's `EmbeddingGemma` ONNX model through
-Transformers.js and local ONNX Runtime CPU inference. Query and document
-prefixes follow the model's retrieval instructions. Model identity is written
-to semantic generation manifests, so changing it requires a new generation.
+The default embedder is the in-process native profile —
+`native:Qwen/Qwen3-Embedding-0.6B` (1024-d) through ONNX Runtime's native
+Node binding, WebGPU (Metal) on Apple Silicon with CPU fallback, batched —
+matching the MinSync local retriever contract: no HTTP sidecar, no gateway
+process. EmbeddingGemma remains as the `legacy-onnx` opt-in profile, and
+`loopback-http` stays an explicit opt-in override for shared gateways.
 
 ### Hybrid
 

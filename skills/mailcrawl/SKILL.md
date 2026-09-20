@@ -105,9 +105,15 @@ mailcrawl repair --semantic --json
 mailcrawl repair --all --json
 ```
 
-`doctor` reports archive, FTS, and semantic-generation state. `repair` is a
+`doctor` reports archive, FTS, and semantic state (healthy, interrupted,
+never-completed, rebuild-required, corrupt, or missing). `repair` is a
 local maintenance operation and should be run only when diagnostics indicate
-that the corresponding index is inconsistent.
+that the corresponding index is inconsistent; `repair --semantic` rebuilds
+the vector table from scratch, while `mailcrawl embed` resumes from the last
+committed batch. Vectors live in LanceDB at
+`<data-dir>/semantic.lance`, written by the default in-process native
+embedder (`Qwen/Qwen3-Embedding-0.6B`); no embedding HTTP server is required
+or started.
 
 ## JSON contract
 

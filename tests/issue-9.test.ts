@@ -1,16 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Archive } from "../src/archive.js";
 
-vi.mock("../src/embedding.js", () => ({
-  createEmbedder: async () => ({
-    embedDocuments: async (texts: string[]) => texts.map(() => [1, 0, 0]),
-    embedQuery: async () => [1, 0, 0],
-  }),
-  embeddingModelName: () => "test-model",
+const axis128 = () => { const vector = new Array<number>(128).fill(0); vector[0] = 1; return vector; };
+
+const { createEmbedder } = vi.hoisted(() => ({
+  createEmbedder: vi.fn(async () => ({
+    embedDocuments: async (texts: string[]) => texts.map(() => axis128()),
+    embedQuery: async () => axis128(),
+  })),
 }));
+
+vi.mock("../src/embedding.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/embedding.js")>();
+  return { ...actual, createEmbedder };
+});
 
 const message = (text: string) => ({
   accountId: "gmail",
@@ -26,57 +32,48 @@ const message = (text: string) => ({
   text,
 });
 
+function counts(archive: Archive): { chunks: number; queued: number; complete: number } {
+  const count = (sql: string) => (archive.db.prepare(sql).get() as { count: number }).count;
+  return {
+    chunks: count("SELECT COUNT(*) AS count FROM chunks"),
+    queued: count("SELECT COUNT(*) AS count FROM embedding_queue"),
+    complete: count("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'complete'"),
+  };
+}
+
 describe("issue 9: semantic orphan cleanup", () => {
   it("removes replaced chunk vectors and queue rows when message content shrinks", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-9-"));
     const archive = new Archive();
     // Two-paragraph text produces multiple chunks
     await archive.sync([message(`${"First paragraph.".repeat(100)}\n\n${"Second paragraph.".repeat(100)}`)]);
-    await archive.indexSemanticGeneration(root);
+    await archive.indexSemantic();
 
     // Shrink to one paragraph — fewer chunks produced
     await archive.sync([message("Short replacement.")]);
-    const second = await archive.indexSemanticGeneration(root);
-    const manifest = JSON.parse(readFileSync(join(root, "generations", second.generation, "manifest.json"), "utf8")) as {
-      vectors: unknown[];
-    };
-    const counts = {
-      chunks: (archive.db.prepare("SELECT COUNT(*) AS count FROM chunks").get() as { count: number }).count,
-      vectors: (archive.db.prepare("SELECT COUNT(*) AS count FROM semantic_vectors").get() as { count: number }).count,
-      queued: (archive.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue").get() as { count: number }).count,
-    };
+    const second = await archive.indexSemantic();
 
-    expect(counts).toEqual({ chunks: 1, vectors: 1, queued: 1 });
-    expect(manifest.vectors).toHaveLength(1);
+    expect(counts(archive)).toEqual({ chunks: 1, queued: 1, complete: 1 });
+    // The shrunken message re-embeds its single live chunk.
+    expect(second.embedded).toBe(1);
     archive.close();
-    rmSync(root, { recursive: true, force: true });
   });
 
-  it("publishes generation manifest with only current chunk vectors", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-9-manifest-"));
+  it("keeps the vector table aligned with current chunks", async () => {
     const archive = new Archive();
     // Long text produces 2+ chunks
     await archive.sync([message(`${"Long paragraph.".repeat(120)}`)]);
-    await archive.indexSemanticGeneration(root);
+    await archive.indexSemantic();
 
     // Change to different-length content that produces a different number of chunks
     await archive.sync([message("Terse.")]);
-    const second = await archive.indexSemanticGeneration(root);
-    const manifest = JSON.parse(readFileSync(join(root, "generations", second.generation, "manifest.json"), "utf8")) as {
-      vectors: Array<{ chunk_id: string }>;
-    };
+    await archive.indexSemantic();
 
-    const chunkCount = (archive.db.prepare("SELECT COUNT(*) AS count FROM chunks").get() as { count: number }).count;
-    const orphanCount = (archive.db.prepare(
-      "SELECT COUNT(*) AS count FROM semantic_vectors WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)",
-    ).get() as { count: number }).count;
-
-    // Manifest vector count matches current chunk count
-    expect(manifest.vectors).toHaveLength(chunkCount);
-    // Zero orphan vectors
-    expect(orphanCount).toBe(0);
+    const { chunks, queued, complete } = counts(archive);
+    expect(complete).toBe(chunks);
+    expect(queued).toBe(chunks);
+    // Semantic search only surfaces live chunks.
+    expect((await archive.searchSemantic("Terse.")).every((hit) => hit.mode === "semantic")).toBe(true);
     archive.close();
-    rmSync(root, { recursive: true, force: true });
   });
 
   it("cleans persisted orphan rows from a previous interrupted sync", async () => {
@@ -86,23 +83,15 @@ describe("issue 9: semantic orphan cleanup", () => {
     await archive.sync([message("Current content.")]);
     await archive.indexSemantic();
     // Inject orphan rows that simulate an interrupted sync crash
-    archive.db.prepare("INSERT INTO semantic_vectors (chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)")
-      .run("stale-chunk", "stale-hash", "test-model", "[1,0,0]");
-    archive.db.prepare("INSERT INTO embedding_queue (chunk_id, content_hash, state, attempts) VALUES (?, ?, ?, ?)")
+    archive.db.prepare("INSERT OR REPLACE INTO embedding_queue (chunk_id, content_hash, state, attempts) VALUES (?, ?, ?, ?)")
       .run("stale-chunk", "stale-hash", "pending", 0);
     archive.close();
 
-    // Reopening should clean orphans
+    // Reopening cleans orphans: the queue and vector table hold only live chunks
     const reopened = new Archive(archivePath);
-    const generation = await reopened.indexSemanticGeneration(root);
-    const manifest = JSON.parse(readFileSync(join(root, "generations", generation.generation, "manifest.json"), "utf8")) as {
-      vectors: Array<{ chunk_id: string }>;
-    };
-
-    expect(manifest.vectors).toHaveLength(1);
-    expect(manifest.vectors[0]?.chunk_id).not.toBe("stale-chunk");
-    expect(reopened.db.prepare("SELECT COUNT(*) AS count FROM semantic_vectors").get()).toEqual({ count: 1 });
-    expect(reopened.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue").get()).toEqual({ count: 1 });
+    await reopened.indexSemantic();
+    expect(counts(reopened)).toEqual({ chunks: 1, queued: 1, complete: 1 });
+    expect(await reopened.searchSemantic("Current content.")).toHaveLength(1);
     reopened.close();
     rmSync(root, { recursive: true, force: true });
   });

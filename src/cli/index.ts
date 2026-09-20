@@ -5,11 +5,13 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
-import type { SearchFilters } from "../types.js";
+import type { EmbedderConfig, SearchFilters } from "../types.js";
 import { redactDiagnostic } from "../redact.js";
 import { inspectKoreanAnalyzer, resolveKiwiModelDir } from "../kiwi-runtime.js";
-import type { LoopbackHttpConfig } from "../types.js";
-import { embeddingModelName, loopbackConfigFromEnvironment } from "../embedding.js";
+import {
+  DEFAULT_NATIVE_BATCH_SIZE, DEFAULT_NATIVE_MODEL, embeddingModelName,
+  nativeModelProfile, parseNativeDevice, parseNativeDtype,
+} from "../embedding.js";
 
 const program = new Command();
 program.name("mailcrawl").description("Local privacy-first email indexing CLI");
@@ -54,7 +56,12 @@ program
 program
   .command("index")
   .alias("embed")
-  .option("--provider <provider>", "embedding provider", "local")
+  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+  .option("--model <model>", "native embedding model id")
+  .option("--device <device>", "native device: auto, cpu, webgpu, metal")
+  .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
+  .option("--batch-size <n>", "texts per embedding batch")
+  .option("--rebuild", "discard existing vectors and re-embed everything")
   .option("--embed-url <url>")
   .option("--embed-model <model>")
   .option("--embed-dim <n>")
@@ -62,11 +69,14 @@ program
   .option("--passage-prefix <prefix>")
   .option("--embed-timeout <ms>")
   .option("--json")
-  .action(async (options: EmbedOptions, command: Command) => {
+  .action(async (options: EmbedOptions & { rebuild?: boolean }, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
     const config = embedderConfig(options);
     const archive = new Archive(join(dataDir, "archive.sqlite"), config);
-    try { output({ ...await archive.indexSemanticGeneration(join(dataDir, "semantic")), embedder: embeddingModelName(config) }, options.json); } finally { archive.close(); }
+    try {
+      const report = await archive.indexSemantic({ rebuild: options.rebuild === true });
+      output({ ...report, embedder: embeddingModelName(config) }, options.json);
+    } finally { archive.close(); }
   });
 
 for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
@@ -81,7 +91,11 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--after <date>")
     .option("--before <date>")
     .option("--limit <n>", "result limit", "10")
-    .option("--provider <provider>", "embedding provider", "local")
+    .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+    .option("--model <model>", "native embedding model id")
+    .option("--device <device>", "native device: auto, cpu, webgpu, metal")
+    .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
+    .option("--batch-size <n>", "texts per embedding batch")
     .option("--embed-url <url>")
     .option("--embed-model <model>")
     .option("--embed-dim <n>")
@@ -117,7 +131,11 @@ program
   .option("--after <date>")
   .option("--before <date>")
   .option("--limit <n>", "result limit", "10")
-  .option("--provider <provider>", "embedding provider", "local")
+  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+  .option("--model <model>", "native embedding model id")
+  .option("--device <device>", "native device: auto, cpu, webgpu, metal")
+  .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
+  .option("--batch-size <n>", "texts per embedding batch")
   .option("--embed-url <url>")
   .option("--embed-model <model>")
   .option("--embed-dim <n>")
@@ -189,9 +207,9 @@ program
     try {
       if (options.fix) await resolveKiwiModelDir();
       let semantic: unknown = "missing";
-      try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
-      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
-      const semanticCommitted = typeof semantic === "object" && semantic !== null && "generation" in semantic;
+      try { semantic = await archive.semanticSummary(); }
+      catch (error) { semantic = redactDiagnostic({ status: "corrupt", error: error instanceof Error ? error.message : String(error) }); }
+      const semanticCommitted = typeof semantic === "object" && semantic !== null && "status" in semantic && (semantic as { status: string }).status === "healthy";
       output({
         name: "mailcrawl",
         archive: join(dataDir, "archive.sqlite"),
@@ -217,8 +235,8 @@ program
     const archive = new Archive(archivePath);
     try {
       let semantic: unknown = "missing";
-      try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
-      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
+      try { semantic = await archive.semanticSummary(); }
+      catch (error) { semantic = redactDiagnostic({ status: "corrupt", error: error instanceof Error ? error.message : String(error) }); }
       output({ name: "mailcrawl", archive: archivePath, archivePresent: true, ...archive.status(), semantic }, options.json);
     } finally { archive.close(); }
   });
@@ -228,7 +246,11 @@ program
   .option("--fts")
   .option("--semantic")
   .option("--all")
-  .option("--provider <provider>", "embedding provider", "local")
+  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+  .option("--model <model>", "native embedding model id")
+  .option("--device <device>", "native device: auto, cpu, webgpu, metal")
+  .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
+  .option("--batch-size <n>", "texts per embedding batch")
   .option("--embed-url <url>")
   .option("--embed-model <model>")
   .option("--embed-dim <n>")
@@ -245,7 +267,7 @@ program
       if (options.semantic || options.all) {
         const config = embedderConfig(options);
         const semanticArchive = config ? new Archive(join(dataDir, "archive.sqlite"), config) : archive;
-        try { result.semantic = await semanticArchive.indexSemanticGeneration(join(dataDir, "semantic")); }
+        try { result.semantic = await semanticArchive.indexSemantic({ rebuild: true }); }
         finally { if (semanticArchive !== archive) semanticArchive.close(); }
       }
       if (options.fts || options.all) result.fts = archive.repairFts();
@@ -270,17 +292,66 @@ program.parseAsync().catch((error: unknown) => {
 });
 
 interface JsonOptions { json?: boolean }
-interface EmbedOptions extends JsonOptions { provider: string; embedUrl?: string; embedModel?: string; embedDim?: string; queryPrefix?: string; passagePrefix?: string; embedTimeout?: string }
+interface EmbedOptions extends JsonOptions {
+  provider: string;
+  model?: string;
+  device?: string;
+  dtype?: string;
+  batchSize?: string;
+  embedUrl?: string;
+  embedModel?: string;
+  embedDim?: string;
+  queryPrefix?: string;
+  passagePrefix?: string;
+  embedTimeout?: string;
+}
 interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; concurrency?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
 interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
 }
-function embedderConfig(options: EmbedOptions): LoopbackHttpConfig | undefined {
-  if (options.provider === "local") return loopbackConfigFromEnvironment();
-  if (options.provider !== "loopback-http") throw new Error(`unsupported embedding provider: ${options.provider}`);
-  if (!options.embedUrl || !options.embedModel || !options.embedDim) throw new Error("--embed-url, --embed-model, and --embed-dim are required for loopback-http");
-  return { provider: "loopback-http", url: options.embedUrl, model: options.embedModel, dimension: Number(options.embedDim), queryPrefix: options.queryPrefix, passagePrefix: options.passagePrefix, timeoutMs: options.embedTimeout ? Number(options.embedTimeout) : undefined };
+function embedderConfig(options: EmbedOptions): EmbedderConfig {
+  if (process.env.MAILCRAWL_EMBEDDER === "mock") return { provider: "mock", batchSize: optionalCount(options.batchSize) };
+  // "local" was the pre-#39 default; it names the same in-process path as "native".
+  const provider = options.provider === "local" ? "native" : options.provider;
+  if (provider === "loopback-http") {
+    const url = options.embedUrl ?? process.env.MAILCRAWL_EMBED_URL;
+    const model = options.embedModel ?? process.env.MAILCRAWL_EMBED_MODEL;
+    const dimension = Number(options.embedDim ?? process.env.MAILCRAWL_EMBED_DIM);
+    if (!url || !model || !Number.isInteger(dimension) || dimension <= 0) throw new Error("--embed-url, --embed-model, and --embed-dim are required for loopback-http");
+    return {
+      provider: "loopback-http", url, model, dimension,
+      queryPrefix: options.queryPrefix, passagePrefix: options.passagePrefix,
+      timeoutMs: options.embedTimeout ? Number(options.embedTimeout) : undefined,
+      batchSize: optionalCount(options.batchSize),
+    };
+  }
+  if (provider === "legacy-onnx") return { provider: "legacy-onnx", batchSize: optionalCount(options.batchSize) };
+  if (provider !== "native") throw new Error(`unsupported embedding provider: ${options.provider}`);
+  const model = options.model ?? process.env.MAILCRAWL_NATIVE_MODEL ?? DEFAULT_NATIVE_MODEL;
+  const device = parseNativeDevice(options.device ?? process.env.MAILCRAWL_NATIVE_DEVICE ?? "auto");
+  const dtype = parseNativeDtype(options.dtype ?? process.env.MAILCRAWL_NATIVE_DTYPE ?? "q4f16");
+  return {
+    provider: "native",
+    model,
+    dimension: nativeModelProfile(model).dimension,
+    device,
+    dtype,
+    batchSize: optionalCount(options.batchSize) ?? envBatchSize() ?? DEFAULT_NATIVE_BATCH_SIZE,
+    queryPrefix: options.queryPrefix,
+    passagePrefix: options.passagePrefix,
+  };
+}
+
+function optionalCount(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const size = Number(value);
+  if (!Number.isInteger(size) || size <= 0) throw new Error(`batch size must be a positive integer: ${value}`);
+  return size;
+}
+
+function envBatchSize(): number | undefined {
+  return optionalCount(process.env.MAILCRAWL_EMBED_BATCH_SIZE);
 }
 function fixtureSource(options: SyncOptions): FixtureSource {
   if (!options.fixture) throw new Error("--fixture is required for selected source");
@@ -300,12 +371,6 @@ function readConcurrency(options: SyncOptions): number | undefined {
     throw new Error(`--concurrency must be a positive integer: ${options.concurrency}`);
   }
   return concurrency;
-}
-function semanticStatus(archive: Archive, semantic: { generation: string; archiveRevision: string; vectorCount: number }): object {
-  return semantic.archiveRevision === archive.status().archiveRevision ? { ...semantic, status: "healthy" } : { ...semantic, status: "stale" };
-}
-function semanticErrorStatus(error: unknown): "missing" | "corrupt" {
-  return error instanceof Error && "code" in error && error.code === "ENOENT" ? "missing" : "corrupt";
 }
 function output(value: unknown, json?: boolean): void {
   if (json) console.log(JSON.stringify(value));

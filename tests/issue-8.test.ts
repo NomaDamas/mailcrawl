@@ -9,10 +9,10 @@ const { createEmbedder } = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock("../src/embedding.js", () => ({
-  createEmbedder,
-  embeddingModelName: () => "test-model",
-}));
+vi.mock("../src/embedding.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/embedding.js")>();
+  return { ...actual, createEmbedder };
+});
 
 const message: MailMessage = {
   accountId: "gmail",
@@ -112,7 +112,7 @@ describe("issue 8: embedding queue lifecycle", () => {
     // Then the chunk is embedded and its queue row restored as complete
     expect(index.embedded).toBe(1);
     expect(archive.db.prepare("SELECT state FROM embedding_queue").all()).toEqual([{ state: "complete" }]);
-    expect(archive.db.prepare("SELECT COUNT(*) AS count FROM semantic_vectors").get()).toMatchObject({ count: 1 });
+    expect(await archive.searchSemantic("Queue content.")).toHaveLength(1);
 
     // And a later sync reports no backlog
     const report = await archive.sync([message]);

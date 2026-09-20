@@ -60,9 +60,9 @@ describe("issue #31 loopback HTTP embedding provider", () => {
     })).toBe("loopback-http:shared-model:3:http://localhost:4318/embed:::" + 30_000);
   });
 
-  it("records the configured provider identity in the native manifest", async () => {
+  it("records the configured provider identity next to the vector table even when embedding fails", async () => {
     const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-31-"));
-    const archive = new Archive(":memory:", {
+    const archive = new Archive(join(root, "archive.sqlite"), {
       provider: "loopback-http",
       url: "http://localhost:4318/embed",
       model: "shared-model",
@@ -74,10 +74,12 @@ describe("issue #31 loopback HTTP embedding provider", () => {
         threadId: "t", subject: "Manifest", from: "a@example.com", to: [], cc: [],
         date: "2026-08-26T00:00:00Z", text: "manifest body",
       }]);
-      // The configured endpoint is intentionally unreachable; manifest publication
-      // must not hide provider identity when the embedding request fails.
-      await expect(archive.indexSemanticGeneration(root)).rejects.toThrow();
-      expect(() => readFileSync(join(root, "CURRENT"), "utf8")).toThrow();
+      // The configured endpoint is intentionally unreachable; the persisted
+      // embedder identity must still record the provider, and no batch may commit.
+      await expect(archive.indexSemantic()).rejects.toThrow();
+      const identity = JSON.parse(readFileSync(join(root, "semantic.identity.json"), "utf8"));
+      expect(identity).toMatchObject({ provider: "loopback-http", model: "shared-model", dimension: 3 });
+      expect(archive.db.prepare("SELECT state FROM embedding_queue").all()).toEqual([{ state: "pending" }]);
     } finally {
       archive.close();
       rmSync(root, { recursive: true, force: true });

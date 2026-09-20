@@ -42,6 +42,9 @@ describe("CLI contract", () => {
     }
   });
 
+  // Five sequential CLI cold starts. Windows CI spends ~1s each just spawning
+  // node + native addons (transformers, lancedb, better-sqlite3), so the
+  // default 5s vitest budget times out before embed/repair finish.
   it("supports the documented status, embed, repair all, and fts commands", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "mailcrawl-cli-contract-"));
     try {
@@ -66,7 +69,7 @@ describe("CLI contract", () => {
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("keeps malformed commands as nonzero failures", async () => {
     await expect(run("node", ["dist/cli/index.js", "not-a-command"])).rejects.toMatchObject({ code: 1 });

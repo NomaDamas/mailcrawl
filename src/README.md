@@ -24,9 +24,14 @@ with a matching Kiwi model directory containing:
 For current Kiwi releases, use the complete model variant directory described
 in `docs/multilingual-installation.md`; do not mix model and WASM versions.
 
-Semantic indexing uses the local `EmbeddingGemma` ONNX model through
-Transformers.js and ONNX Runtime. The model is downloaded to the local cache
-on first use.
+Semantic indexing uses the in-process native embedder —
+`Qwen/Qwen3-Embedding-0.6B` via ONNX Runtime's native binding (WebGPU/Metal
+on Apple Silicon, CPU fallback) — and stores vectors in a LanceDB table at
+`<data-dir>/semantic.lance`. The model is downloaded to the local cache on
+first use. `EmbeddingGemma` remains available as the `legacy-onnx` opt-in
+profile, and `loopback-http` stays an explicit override (#31). The embedder
+identity persisted at `<data-dir>/semantic.identity.json` governs reuse: a
+mismatch forces a full rebuild, never silent reuse.
 
 Japanese and Chinese use the real Kagome and GSE analyzers from the discrawl
 multilingual design. Neither analyzer currently has a usable official Node

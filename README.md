@@ -34,21 +34,21 @@ surface instead of opening the archive database.
 - MIME normalization, HTML-to-text conversion, and quoted-reply handling
 - Email-aware, thread-aware chunking
 - Incremental archive, FTS5, and embedding updates
-- Local EmbeddingGemma vector storage with Transformers.js and ONNX Runtime
+- In-process native embeddings (`Qwen/Qwen3-Embedding-0.6B` via ONNX Runtime, WebGPU/Metal on Apple Silicon with CPU fallback) stored in LanceDB
 - FTS, semantic, and hybrid search modes
 - JSON output, bounded diagnostics, `status`, `doctor`, and `repair`
 - No credential values in logs, diagnostics, or indexed metadata by default
 
 See [`docs/architecture.md`](docs/architecture.md) for the data model and CLI
 contract. Lexical analyzer changes invalidate language-specific FTS fields;
-run `mailcrawl sync` to rebuild them before multilingual search. Semantic model
-changes require `mailcrawl index` to create a new vector generation.
+run `mailcrawl sync` to rebuild them before multilingual search. Semantic
+embedder changes require `mailcrawl index` to rebuild the vector table.
 
 When a lexical analyzer or its model changes, the stored analyzer fingerprint
 invalidates all language-specific FTS fields. Run a complete `mailcrawl sync`
 before multilingual search; the command re-analyzes existing messages and
 atomically records the new fingerprint. Embedding model changes are independent
-and require a new `mailcrawl index` generation.
+and require `mailcrawl index` to rebuild the vector table.
 
 ## Sync read concurrency
 
@@ -72,20 +72,49 @@ Chinese helper builds, environment variables, smoke tests, and license
 requirements, follow [`docs/multilingual-installation.md`](docs/multilingual-installation.md)
 before using multilingual indexing or search.
 
-## Shared loopback embedding provider
+## Semantic index
 
-The local in-process model is the default. Opt into a local HTTP runtime with
-`--provider loopback-http`, `--embed-url`, `--embed-model`, and `--embed-dim`
-on `index`, `repair --semantic`, or semantic search. Only HTTP URLs for
-`127.0.0.1`, `localhost`, or `::1` are accepted. Query/passage prefixes and
-timeout are optional and are included in the provider identity. Any provider
-setting change rebuilds vectors, while a failed rebuild preserves the prior
-`CURRENT` generation.
+The default semantic path is fully in-process: no HTTP sidecar, no gateway.
+Vectors live in a LanceDB table at `<data-dir>/semantic.lance` (a typed
+`Float32` vector column, SQL predicate pushdown for account/mailbox and date
+filters) while SQLite stays the source of truth for messages, chunks, and
+FTS. Indexing pages chunks in small batches (`--batch-size`, default 4 for
+the native profile, mirroring MinSync) and commits each batch — vector
+upsert plus queue completion — so a crash resumes from the last committed
+batch instead of restarting from zero.
 
-The equivalent environment contract is
-`MAILCRAWL_EMBEDDER_PROVIDER`, `MAILCRAWL_EMBED_URL`,
-`MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`, `MAILCRAWL_QUERY_PREFIX`,
-`MAILCRAWL_PASSAGE_PREFIX`, and `MAILCRAWL_EMBED_TIMEOUT`.
+The active embedder identity (provider, model, dimension, prefixes, runtime
+build) is persisted next to the table in
+`<data-dir>/semantic.identity.json`. Identity is data: a mismatch on the next
+`mailcrawl index` discards the vector table and re-embeds everything, never
+silently reusing vectors from a different embedding space. Semantic search
+against a mismatched table fails loudly with a rebuild hint instead of
+returning garbage scores. `mailcrawl repair --semantic` forces a full rebuild.
+
+### Embedding providers
+
+- `native` (default): in-process `Qwen/Qwen3-Embedding-0.6B` (1024-d) through
+  ONNX Runtime's native binding — WebGPU (Metal on Apple Silicon) with
+  automatic CPU fallback. Configure with `--model`, `--device` (`auto`, `cpu`,
+  `webgpu`, `metal`), `--dtype` (default `q4f16` on WebGPU), and
+  `--batch-size`.
+- `legacy-onnx`: the pre-0.2 EmbeddingGemma profile on CPU, kept for archives
+  that must keep their old vector space. On the first index run this profile
+  imports compatible legacy JSON vectors instead of re-embedding them.
+- `loopback-http`: an explicit opt-in for operators who already run a shared
+  embedding gateway (#31). Only HTTP URLs for `127.0.0.1`, `localhost`, or
+  `::1` are accepted. Requires `--embed-url`, `--embed-model`, and
+  `--embed-dim`; query/passage prefixes and timeout are optional and are
+  included in the provider identity.
+
+The equivalent environment contract is `MAILCRAWL_EMBEDDER_PROVIDER`
+(`native`, `legacy-onnx`, or `loopback-http`), `MAILCRAWL_NATIVE_MODEL`,
+`MAILCRAWL_NATIVE_DEVICE`, `MAILCRAWL_NATIVE_DTYPE`,
+`MAILCRAWL_EMBED_BATCH_SIZE`, plus the loopback variables
+`MAILCRAWL_EMBED_URL`, `MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`,
+`MAILCRAWL_QUERY_PREFIX`, `MAILCRAWL_PASSAGE_PREFIX`, and
+`MAILCRAWL_EMBED_TIMEOUT`. Any provider identity change triggers a full
+vector rebuild on the next index run.
 
 ## Releasing
 

@@ -35,7 +35,26 @@ Kagome does not currently provide an official Node binding.
 The GSE repository mentions `gse-bind`, but no usable npm package was available
 at integration time, so this remains a separate Go helper.
 
-## EmbeddingGemma
+## Qwen3-Embedding (default semantic model)
+
+- Model: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
+- ONNX export: https://huggingface.co/onnx-community/Qwen3-Embedding-0.6B-ONNX
+- License: Apache-2.0 (model weights)
+
+The model is downloaded and executed locally through ONNX Runtime's native
+Node binding (WebGPU/Metal on Apple Silicon, CPU elsewhere). Model weights are
+not redistributed in the mailcrawl package.
+
+## LanceDB
+
+- Package: https://www.npmjs.com/package/@lancedb/lancedb
+- Source: https://github.com/lancedb/lancedb
+- License: Apache-2.0
+
+The LanceDB native Node binding stores the semantic vector table at
+`<data-dir>/semantic.lance`.
+
+## EmbeddingGemma (legacy opt-in profile)
 
 - Model: https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX
 - Base model: Google EmbeddingGemma
