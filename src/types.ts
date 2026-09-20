@@ -1,6 +1,39 @@
 export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
 
-export type EmbedderProvider = "local" | "loopback-http";
+export type EmbedderProvider = "native" | "legacy-onnx" | "loopback-http" | "mock";
+
+/** Quantization for the in-process native embedder (ONNX Runtime). */
+export type NativeDtype = "fp32" | "fp16" | "q8" | "int8" | "q4" | "q4f16" | "uint8";
+
+/**
+ * In-process native embedder (issue #39): no HTTP sidecar, batched inference,
+ * GPU (WebGPU/Metal on Apple Silicon) with CPU fallback. Mirrors the MinSync
+ * `native:Qwen/Qwen3-Embedding-0.6B` profile.
+ */
+export interface NativeEmbedderConfig {
+  provider: "native";
+  /** Registry id, e.g. `Qwen/Qwen3-Embedding-0.6B`. */
+  model: string;
+  dimension: number;
+  /** "auto" resolves WebGPU first and falls back to CPU; "metal" is an alias for "webgpu". */
+  device: "auto" | "cpu" | "webgpu";
+  dtype: NativeDtype;
+  /** Number of texts per inference batch (MinSync uses 4 for native Metal). */
+  batchSize: number;
+  queryPrefix?: string;
+  passagePrefix?: string;
+}
+
+/** Legacy opt-in profile: Transformers.js EmbeddingGemma on CPU (pre-#39 default). */
+export interface LegacyOnnxConfig {
+  provider: "legacy-onnx";
+  batchSize?: number;
+}
+
+export interface MockEmbedderConfig {
+  provider: "mock";
+  batchSize?: number;
+}
 
 export interface LoopbackHttpConfig {
   provider: "loopback-http";
@@ -10,6 +43,26 @@ export interface LoopbackHttpConfig {
   queryPrefix?: string;
   passagePrefix?: string;
   timeoutMs?: number;
+  batchSize?: number;
+}
+
+export type EmbedderConfig = NativeEmbedderConfig | LegacyOnnxConfig | LoopbackHttpConfig | MockEmbedderConfig;
+
+/**
+ * Embedder identity persisted next to the semantic vector table (issue #39:
+ * "identity is data"). A mismatch requires a full rebuild, never silent reuse.
+ * `runtimeBuild` and `indexedRevision` are informational and excluded from
+ * identity comparison.
+ */
+export interface EmbedderIdentity {
+  provider: string;
+  model: string;
+  dimension: number;
+  queryPrefix?: string;
+  passagePrefix?: string;
+  runtimeBuild: string;
+  /** Archive revision at the last fully completed index run. */
+  indexedRevision?: string;
 }
 
 export interface MailMessage {

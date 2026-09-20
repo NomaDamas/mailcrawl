@@ -1,16 +1,32 @@
 import Database from "better-sqlite3";
-import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import type { ClassificationPolicy, Chunk, LoopbackHttpConfig, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import type { ClassificationPolicy, Chunk, EmbedderConfig, EmbedderIdentity, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { scopedId, snippet } from "./util.js";
-import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.js";
+import { createEmbedder, embedderIdentity, embedderIdentityLabel, embeddingBatchSize, legacyEmbedderIdentity, LEGACY_EMBEDDING_MODEL, type Embedder } from "./embedding.js";
+import { LanceSemanticStore, MemorySemanticStore, sameEmbedder, type SemanticStore } from "./semantic-store.js";
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
 
-const RETAINED_SEMANTIC_GENERATIONS = 2;
-const SEMANTIC_GENERATION_NAME = /^gen-[0-9a-f]{16}-[0-9]+(?:-[0-9a-f]+)?$/;
+export interface SemanticIndexReport {
+  embedded: number;
+  reused: number;
+  archiveRevision: string;
+  /** True when the vector table was discarded and rebuilt from scratch. */
+  rebuilt: boolean;
+}
+
+export interface SemanticSummary {
+  status: "missing" | "never-completed" | "interrupted" | "rebuild-required" | "corrupt" | "stale" | "healthy";
+  provider?: string;
+  model?: string;
+  dimension?: number;
+  vectorCount: number;
+  embeddingBacklog: number;
+  archiveRevision: string;
+}
 
 export class Archive {
   readonly db: Database.Database;
@@ -18,10 +34,14 @@ export class Archive {
   private lexical?: LexicalAnalyzers;
   private operationTail: Promise<void> = Promise.resolve();
   private lexicalRebuildRequired: boolean;
-  private readonly embedderConfig?: LoopbackHttpConfig;
+  private readonly embedderConfig?: EmbedderConfig;
+  /** Directory holding `archive.sqlite` (and `semantic.lance`); undefined for `:memory:` archives. */
+  private readonly dataDir?: string;
+  private store?: SemanticStore;
 
-  constructor(path = ":memory:", embedderConfig?: LoopbackHttpConfig) {
+  constructor(path = ":memory:", embedderConfig?: EmbedderConfig) {
     this.embedderConfig = embedderConfig;
+    this.dataDir = path === ":memory:" ? undefined : dirname(path);
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
@@ -46,7 +66,7 @@ export class Archive {
     return this.runExclusive(() => this.syncUnlocked(messages, policy));
   }
 
-  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
+  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; vectorCount: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
     const count = (table: "messages" | "chunks"): number =>
       Number((this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
     const ftsRows = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks_fts").get() as { count: number }).count);
@@ -56,9 +76,30 @@ export class Archive {
       messageCount: count("messages"),
       chunkCount,
       embeddingBacklog: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count),
+      // Vectors live in the Lance table now; queue-complete rows are committed 1:1 with them.
+      vectorCount: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'complete'").get() as { count: number }).count),
       archiveRevision: this.revision(),
       fts: { status: metadata?.version === LEXICAL_ANALYZER_VERSION && ftsRows === chunkCount ? "healthy" : "stale", rows: ftsRows },
     };
+  }
+
+  /** Semantic index health from the vector-store identity plus the embedding queue. */
+  async semanticSummary(): Promise<SemanticSummary> {
+    const stats = this.status();
+    const base = { vectorCount: stats.vectorCount, embeddingBacklog: stats.embeddingBacklog, archiveRevision: stats.archiveRevision };
+    const store = await this.findStore();
+    const identity = store?.readIdentity();
+    if (!identity) {
+      const status = stats.embeddingBacklog > 0 ? (stats.vectorCount > 0 ? "interrupted" : "never-completed") : "missing";
+      return { status, ...base };
+    }
+    const detail = { provider: identity.provider, model: identity.model, dimension: identity.dimension, ...base };
+    if (!sameEmbedder(identity, embedderIdentity(this.embedderConfig))) return { status: "rebuild-required", ...detail };
+    const stored = store ? await store.countRows() : 0;
+    if (stats.embeddingBacklog > 0) return { status: "interrupted", ...detail, vectorCount: stored };
+    if (stored !== stats.vectorCount) return { status: "corrupt", ...detail, vectorCount: stored };
+    if (identity.indexedRevision && identity.indexedRevision !== stats.archiveRevision) return { status: "stale", ...detail };
+    return { status: "healthy", ...detail };
   }
 
   private async syncUnlocked(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
@@ -154,11 +195,39 @@ export class Archive {
       .slice(0, limit).map(({ hit, score }) => ({ ...hit, score }));
   }
 
-  async indexSemantic(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
-    return this.runExclusive(() => this.indexSemanticUnlocked());
+  async indexSemantic(options: { rebuild?: boolean } = {}): Promise<SemanticIndexReport> {
+    return this.runExclusive(() => this.indexSemanticUnlocked(options.rebuild === true));
   }
 
-  private async indexSemanticUnlocked(): Promise<{ embedded: number; reused: number; archiveRevision: string }> {
+  private async indexSemanticUnlocked(rebuild: boolean): Promise<SemanticIndexReport> {
+    const expected = embedderIdentity(this.embedderConfig);
+    const store = await this.getStore();
+    let rebuilt = false;
+    const existingIdentity = store.readIdentity();
+    if (rebuild || (existingIdentity && !sameEmbedder(existingIdentity, expected))) {
+      // Identity is data: a mismatch (or an explicit rebuild) discards the
+      // vector table and re-embeds everything. Never silent reuse.
+      if (existingIdentity || rebuild) {
+        await store.drop();
+        rebuilt = true;
+      }
+      this.discardLegacyVectors();
+      this.resetQueuePending();
+      await store.ensureTable(expected.dimension);
+      store.writeIdentity(expected);
+    } else if (!existingIdentity) {
+      const legacy = this.readLegacyVectors();
+      const importable = legacy && sameEmbedder(legacyEmbedderIdentity(legacy.model, legacy.vector.length), expected);
+      if (importable) await this.importLegacyVectors(store);
+      else {
+        if (legacy) {
+          this.discardLegacyVectors();
+          this.resetQueuePending();
+        }
+        await store.ensureTable(expected.dimension);
+      }
+      store.writeIdentity(expected);
+    }
     const completeQueueRow = this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ?");
     const reconcile = this.db.transaction(() => {
       this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)").run();
@@ -167,128 +236,155 @@ export class Archive {
         WHERE chunk_id NOT IN (SELECT chunk_id FROM embedding_queue)`).run();
     });
     reconcile();
-    const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
-      chunk_id: string; text: string; content_hash: string;
-    }[];
+    await this.sweepOrphanedVectors(store);
+    const batchSize = embeddingBatchSize(this.embedderConfig);
+    const pageQuery = this.db.prepare(`SELECT c.chunk_id, c.text, c.content_hash, c.account_id, c.mailbox,
+      c.thread_id, c.message_id, m.date, lower(m.from_address) AS from_address
+      FROM chunks c JOIN messages m ON m.message_id = c.message_id
+      ORDER BY c.chunk_id LIMIT ? OFFSET ?`);
+    const queueQuery = this.db.prepare("SELECT content_hash, state FROM embedding_queue WHERE chunk_id = ?");
     let embedded = 0;
     let reused = 0;
-    const upsert = this.db.prepare(`INSERT INTO semantic_vectors
-      (chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)
-      ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, model=excluded.model, vector=excluded.vector`);
-    const pending: typeof rows = [];
-    const transaction = this.db.transaction(() => {
+    let embedder: Embedder | undefined;
+    for (let offset = 0; ; offset += batchSize) {
+      const rows = pageQuery.all(batchSize, offset) as ChunkPageRow[];
+      if (!rows.length) break;
+      // Reuse is decided against the stored vectors' content hashes, so a
+      // re-enqueued queue row (or a crash between the Lance commit and the
+      // queue commit) never re-embeds an unchanged chunk.
+      const storedHashes = await store.contentHashes(rows.map((row) => row.chunk_id));
+      const batch: ChunkPageRow[] = [];
       for (const row of rows) {
-        const old = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string; model: string } | undefined;
-        if (old?.content_hash === row.content_hash && old.model === embeddingModelName(this.embedderConfig)) {
-          completeQueueRow.run(row.chunk_id);
+        if (storedHashes.get(row.chunk_id) === row.content_hash) {
+          const queued = queueQuery.get(row.chunk_id) as { content_hash: string; state: string } | undefined;
+          if (queued?.state !== "complete") completeQueueRow.run(row.chunk_id);
           reused++;
           continue;
         }
-        pending.push(row);
+        batch.push(row);
       }
-    });
-    transaction();
-    if (!pending.length) return { embedded, reused, archiveRevision: this.revision() };
-    const embedder = await this.getEmbedder();
-    const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
-    const write = this.db.transaction(() => {
-      for (const [index, row] of pending.entries()) {
-        upsert.run(row.chunk_id, row.content_hash, embeddingModelName(this.embedderConfig), JSON.stringify(vectors[index]));
-        completeQueueRow.run(row.chunk_id);
-        embedded++;
-      }
-    });
-    write();
-    return { embedded, reused, archiveRevision: this.revision() };
-  }
-
-  async indexSemanticGeneration(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
-    return this.runExclusive(() => this.indexSemanticGenerationUnlocked(root));
-  }
-
-  private async indexSemanticGenerationUnlocked(root: string): Promise<{ generation: string; embedded: number; reused: number }> {
-    const currentPath = join(root, "CURRENT");
-    const generationRoot = join(root, "generations");
-    const previousVectors = this.db.prepare("SELECT chunk_id, content_hash, model, vector FROM semantic_vectors ORDER BY chunk_id").all() as SemanticVectorRow[];
-    const previousQueue = this.db.prepare("SELECT chunk_id, content_hash, state, attempts FROM embedding_queue ORDER BY chunk_id").all() as EmbeddingQueueRow[];
-    mkdirSync(generationRoot, { recursive: true });
-    const generation = `gen-${this.revision().slice(0, 16)}-${Date.now()}-${randomBytes(6).toString("hex")}`;
-    const staging = join(generationRoot, `.${generation}.staging`);
-    const publishedGeneration = join(generationRoot, generation);
-    const pointer = join(root, `.CURRENT.${process.pid}`);
-    mkdirSync(staging);
-    let published = false;
-    try {
-      const report = await this.indexSemanticUnlocked();
-      const vectors = this.db.prepare(`SELECT v.chunk_id, v.content_hash, v.vector
-        FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id
-        ORDER BY v.chunk_id`).all();
-      writeFileSync(join(staging, "manifest.json"), JSON.stringify({
-        archiveRevision: this.revision(), vectors, model: embeddingModelName(this.embedderConfig),
+      if (!batch.length) continue;
+      embedder ??= await this.getEmbedder();
+      const vectors = await embedder.embedDocuments(batch.map((row) => row.text));
+      if (vectors.length !== batch.length) throw new Error("embedder returned an unexpected embedding count");
+      const docs = batch.map((row, index) => ({
+        chunkId: row.chunk_id,
+        vector: vectors[index],
+        contentHash: row.content_hash,
+        accountId: row.account_id,
+        mailbox: row.mailbox,
+        threadId: row.thread_id,
+        messageId: row.message_id,
+        date: row.date,
+        fromAddress: row.from_address,
       }));
-      renameSync(staging, publishedGeneration);
-      published = true;
-      writeFileSync(pointer, `${generation}\n`);
-      renameSync(pointer, currentPath);
-      this.cleanupSemanticGenerations(generationRoot, generation);
-      return { generation, embedded: report.embedded, reused: report.reused };
-    } catch (error) {
-      rmSync(staging, { recursive: true, force: true });
-      rmSync(pointer, { force: true });
-      if (!published) rmSync(publishedGeneration, { recursive: true, force: true });
-      const restore = this.db.transaction(() => {
-        this.db.exec("DELETE FROM semantic_vectors; DELETE FROM embedding_queue;");
-        const restoreVector = this.db.prepare("INSERT INTO semantic_vectors(chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)");
-        for (const row of previousVectors) restoreVector.run(row.chunk_id, row.content_hash, row.model, row.vector);
-        const restoreQueue = this.db.prepare("INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts) VALUES (?, ?, ?, ?)");
-        for (const row of previousQueue) restoreQueue.run(row.chunk_id, row.content_hash, row.state, row.attempts);
+      await store.upsert(docs);
+      // Per-batch commit: the Lance upsert lands first, then the queue rows.
+      // A crash in between re-embeds at most one batch on the next run.
+      const commit = this.db.transaction(() => {
+        for (const doc of docs) {
+          completeQueueRow.run(doc.chunkId);
+          embedded++;
+        }
       });
-      restore();
-      throw error;
+      commit();
     }
+    const identity = store.readIdentity();
+    if (identity) store.writeIdentity({ ...identity, indexedRevision: this.revision() });
+    return { embedded, reused, archiveRevision: this.revision(), rebuilt };
   }
 
-  private cleanupSemanticGenerations(generationRoot: string, activeGeneration: string): void {
-    const generations = readdirSync(generationRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && SEMANTIC_GENERATION_NAME.test(entry.name))
-      .map((entry) => entry.name)
-      .sort((left, right) => {
-        const leftTimestamp = this.generationTimestamp(left);
-        const rightTimestamp = this.generationTimestamp(right);
-        return rightTimestamp - leftTimestamp || right.localeCompare(left);
+  /** Vector rows left behind by removed messages are swept at index time. */
+  private async sweepOrphanedVectors(store: SemanticStore): Promise<void> {
+    const chunkIds = new Set((this.db.prepare("SELECT chunk_id FROM chunks").all() as { chunk_id: string }[]).map((row) => row.chunk_id));
+    const stored = await store.listChunkIds();
+    const orphaned = stored.filter((chunkId) => !chunkIds.has(chunkId));
+    if (orphaned.length) await store.deleteChunkIds(orphaned);
+  }
+
+  private readLegacyVectors(): { chunk_id: string; content_hash: string; model: string; vector: number[] } | undefined {
+    const table = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_vectors'").get();
+    if (!table) return undefined;
+    const rows = this.db.prepare("SELECT chunk_id, content_hash, model, vector FROM semantic_vectors ORDER BY chunk_id").all() as { chunk_id: string; content_hash: string; model: string; vector: string }[];
+    if (!rows.length) return undefined;
+    const first = rows[0];
+    let vector: number[];
+    try {
+      vector = JSON.parse(first.vector) as number[];
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(vector) || !vector.length) return undefined;
+    return { chunk_id: first.chunk_id, content_hash: first.content_hash, model: first.model, vector };
+  }
+
+  private async importLegacyVectors(store: SemanticStore): Promise<number> {
+    const rows = this.db.prepare("SELECT chunk_id, content_hash, vector FROM semantic_vectors ORDER BY chunk_id").all() as { chunk_id: string; content_hash: string; vector: string }[];
+    const chunkQuery = this.db.prepare(`SELECT c.chunk_id, c.account_id, c.mailbox, c.thread_id, c.message_id,
+      c.content_hash, m.date, lower(m.from_address) AS from_address
+      FROM chunks c JOIN messages m ON m.message_id = c.message_id`);
+    const chunks = new Map((chunkQuery.all() as ChunkPageRow[]).map((row) => [row.chunk_id, row]));
+    const completeQueue = this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ?");
+    const docs = [];
+    const imported: string[] = []
+    for (const row of rows) {
+      const chunk = chunks.get(row.chunk_id);
+      if (!chunk || chunk.content_hash !== row.content_hash) continue;
+      let vector: number[];
+      try {
+        vector = JSON.parse(row.vector) as number[];
+      } catch {
+        continue;
+      }
+      docs.push({
+        chunkId: row.chunk_id, vector, contentHash: row.content_hash,
+        accountId: chunk.account_id, mailbox: chunk.mailbox, threadId: chunk.thread_id,
+        messageId: chunk.message_id, date: chunk.date, fromAddress: chunk.from_address,
       });
-    const retained = new Set(generations.slice(0, RETAINED_SEMANTIC_GENERATIONS));
-    retained.add(activeGeneration);
-    for (const generation of generations) {
-      if (!retained.has(generation)) rmSync(join(generationRoot, generation), { recursive: true, force: true });
+      imported.push(row.chunk_id);
     }
+    if (docs.length) await store.upsert(docs);
+    const commit = this.db.transaction(() => {
+      for (const chunkId of imported) completeQueue.run(chunkId);
+    });
+    commit();
+    this.discardLegacyVectors();
+    return docs.length;
   }
 
-  private generationTimestamp(name: string): number {
-    const match = /^gen-[0-9a-f]{16}-([0-9]+)(?:-[0-9a-f]+)?$/.exec(name);
-    return match ? Number(match[1]) : 0;
+  private discardLegacyVectors(): void {
+    this.db.exec("DROP TABLE IF EXISTS semantic_vectors");
   }
 
-  semanticGeneration(root: string): { generation: string; archiveRevision: string; vectorCount: number } {
-    const generation = readFileSync(join(root, "CURRENT"), "utf8").trim();
-    if (!SEMANTIC_GENERATION_NAME.test(generation)) throw new Error("invalid semantic generation pointer");
-    const manifest = JSON.parse(readFileSync(join(root, "generations", generation, "manifest.json"), "utf8")) as {
-      archiveRevision: string; vectors: unknown[];
-    };
-    return { generation, archiveRevision: manifest.archiveRevision, vectorCount: manifest.vectors.length };
+  private resetQueuePending(): void {
+    this.db.exec("UPDATE embedding_queue SET state = 'pending', attempts = 0");
   }
 
   async searchSemantic(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
     if (!query.trim()) throw new Error("empty query");
+    const store = await this.findStore();
+    const identity = store?.readIdentity();
+    if (!store || !identity) return [];
+    const expected = embedderIdentity(this.embedderConfig);
+    if (!sameEmbedder(identity, expected)) {
+      throw new Error(`semantic index embedder mismatch: indexed with ${embedderIdentityLabel(identity)}, active embedder is ${embedderIdentityLabel(expected)}; run mailcrawl index to rebuild`);
+    }
     const queryVector = await (await this.getEmbedder()).embedQuery(query);
-    const clauses = ["1 = 1"];
-    const params: unknown[] = [];
+    // `to` lives in SQLite json_each, so it cannot be a Lance predicate: over-fetch, then post-filter.
+    const fetchLimit = filters.to ? Math.min(limit * 10, 1000) : limit;
+    const hits = await store.query(queryVector, filters, fetchLimit);
+    if (!hits.length) return [];
+    const scoreById = new Map(hits.map((hit) => [hit.chunkId, hit.score]));
+    const clauses = [`c.chunk_id IN (${hits.map(() => "?").join(", ")})`];
+    const params: unknown[] = hits.map((hit) => hit.chunkId);
     addFilters(clauses, params, filters);
-    const rows = this.db.prepare(`SELECT v.vector, c.chunk_id, c.message_id, c.thread_id, c.account_id, c.mailbox,
+    const rows = this.db.prepare(`SELECT c.chunk_id, c.message_id, c.thread_id, c.account_id, c.mailbox,
       m.subject, m.from_address, m.to_addresses, m.date, c.text
-      FROM semantic_vectors v JOIN chunks c ON c.chunk_id = v.chunk_id JOIN messages m ON m.message_id = c.message_id
+      FROM chunks c JOIN messages m ON m.message_id = c.message_id
       WHERE ${clauses.join(" AND ")}`).all(...params) as SemanticRow[];
-    return rows.map((row) => ({ row, score: dot(queryVector, JSON.parse(row.vector) as number[]) }))
+    return rows
+      .map((row) => ({ row, score: scoreById.get(row.chunk_id) }))
+      .filter((hit): hit is { row: SemanticRow; score: number } => hit.score !== undefined)
       .sort((a, b) => b.score - a.score || a.row.chunk_id.localeCompare(b.row.chunk_id))
       .slice(0, limit)
       .map(({ row, score }) => ({
@@ -426,7 +522,7 @@ export class Archive {
     for (const row of rows) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
     for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))`).run(message.providerKey);
     this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
-    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
+    // Stale vector rows are swept from the Lance table at the next index run.
     this.db.prepare("DELETE FROM messages WHERE provider_key = ?").run(message.providerKey);
   }
 
@@ -435,7 +531,6 @@ export class Archive {
     for (const row of old) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
     for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)`).run(message.messageId);
     this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
-    this.db.prepare("DELETE FROM semantic_vectors WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = ?)").run(message.messageId);
     this.db.prepare("DELETE FROM chunks WHERE message_id = ?").run(message.messageId);
     for (const chunk of buildChunks(message)) {
       const result = this.db.prepare(`INSERT INTO chunks
@@ -481,6 +576,27 @@ export class Archive {
     return this.embedder;
   }
 
+  /** Opens (and creates if needed) the semantic vector store for indexing. */
+  private async getStore(): Promise<SemanticStore> {
+    if (this.store) return this.store;
+    if (this.dataDir === undefined) {
+      this.store = new MemorySemanticStore();
+      return this.store;
+    }
+    const identity = embedderIdentity(this.embedderConfig);
+    this.store = await LanceSemanticStore.open(this.dataDir, identity.dimension);
+    return this.store;
+  }
+
+  /** Opens the store only when one already exists; read paths never create. */
+  private async findStore(): Promise<SemanticStore | undefined> {
+    if (this.store) return this.store;
+    if (this.dataDir === undefined) return undefined;
+    const existing = await LanceSemanticStore.openExisting(this.dataDir);
+    if (existing) this.store = existing;
+    return existing;
+  }
+
   private searchLexicalTable(table: string, query: string, filters: SearchFilters, limit: number): SearchHit[] {
     const clauses = [`${table} MATCH ?`];
     const params: unknown[] = [literalFtsQuery(query)];
@@ -519,9 +635,8 @@ function migrate(db: Database.Database): void {
   CREATE TABLE IF NOT EXISTS embedding_queue (
     chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS semantic_vectors (
-    chunk_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', vector TEXT NOT NULL
-  );
+  -- Pre-#39 archives keep a legacy semantic_vectors JSON table until the
+  -- first index run imports or discards it (see indexSemanticUnlocked).
   CREATE TABLE IF NOT EXISTS attachments (
     attachment_id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
     name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER, content_hash TEXT, extracted_text TEXT
@@ -534,8 +649,13 @@ function migrate(db: Database.Database): void {
     body_quoted, forwarded_text, attachment_text,
     tokenize = 'unicode61'
   );`);
-  const vectorColumns = db.prepare("PRAGMA table_info(semantic_vectors)").all() as Array<{ name: string }>;
-  if (!vectorColumns.some((column) => column.name === "model")) db.exec("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT ''");
+  // Legacy (pre-#39) semantic_vectors table: add the model column when an old
+  // archive still carries it, so indexSemantic can import or discard it.
+  const legacyVectorsPresent = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_vectors'").get() !== undefined;
+  if (legacyVectorsPresent) {
+    const vectorColumns = db.prepare("PRAGMA table_info(semantic_vectors)").all() as Array<{ name: string }>;
+    if (!vectorColumns.some((column) => column.name === "model")) db.exec("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT ''");
+  }
   for (const language of lexicalFields()) {
     const table = `chunks_fts_${language}`;
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${table} USING fts5(
@@ -553,8 +673,6 @@ function migrate(db: Database.Database): void {
 function cleanupOrphanedSemanticRows(db: Database.Database): void {
   db.prepare(`DELETE FROM embedding_queue
     WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE chunks.chunk_id = embedding_queue.chunk_id)`).run();
-  db.prepare(`DELETE FROM semantic_vectors
-    WHERE NOT EXISTS (SELECT 1 FROM chunks WHERE chunks.chunk_id = semantic_vectors.chunk_id)`).run();
 }
 
 function literalFtsQuery(query: string): string {
@@ -605,10 +723,9 @@ function countExcluded(messages: NormalizedMessage[], excluded: Set<string>): Re
   return counts;
 }
 
-type SemanticVectorRow = { chunk_id: string; content_hash: string; model: string; vector: string };
-type EmbeddingQueueRow = { chunk_id: string; content_hash: string; state: string; attempts: number };
 type SearchRow = { chunk_id: string; message_id: string; thread_id: string; account_id: string; mailbox: string; subject: string; from_address: string; to_addresses: string; date: string; snippet: string; score: number };
-type SemanticRow = Omit<SearchRow, "snippet" | "score"> & { vector: string; text: string };
+type SemanticRow = Omit<SearchRow, "snippet" | "score"> & { text: string };
+type ChunkPageRow = { chunk_id: string; text: string; content_hash: string; account_id: string; mailbox: string; thread_id: string; message_id: string; date: string; from_address: string };
 type AttachmentRow = {
   attachment_id: string;
   message_id: string;
@@ -635,19 +752,4 @@ function chunkRow(row: ChunkRow): Chunk {
 
 function attachmentText(message: NormalizedMessage): string {
   return (message.attachments || []).map((attachment) => attachment.text || "").filter(Boolean).join("\n");
-}
-
-function embed(text: string): number[] {
-  const vector = new Array<number>(128).fill(0);
-  const normalized = text.toLocaleLowerCase().normalize("NFKC");
-  for (let index = 0; index < normalized.length; index++) {
-    const code = normalized.codePointAt(index) ?? 0;
-    vector[(code + index * 31) % vector.length] += 1;
-  }
-  const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
-  return vector.map((value) => value / magnitude);
-}
-
-function dot(left: number[], right: number[]): number {
-  return left.reduce((sum, value, index) => sum + value * (right[index] ?? 0), 0);
 }

@@ -4,17 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Archive } from "../src/archive.js";
 
+const axis128 = () => { const vector = new Array<number>(128).fill(0); vector[0] = 1; return vector; };
+
 const { createEmbedder } = vi.hoisted(() => ({
   createEmbedder: vi.fn(async () => ({
-    embedDocuments: async (texts: string[]) => texts.map(() => [1, 0, 0]),
-    embedQuery: async () => [1, 0, 0],
+    embedDocuments: async (texts: string[]) => texts.map(() => axis128()),
+    embedQuery: async () => axis128(),
   })),
 }));
 
-vi.mock("../src/embedding.js", () => ({
-  createEmbedder,
-  embeddingModelName: () => "test-model",
-}));
+vi.mock("../src/embedding.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/embedding.js")>();
+  return { ...actual, createEmbedder };
+});
 
 const message = (text: string) => ({
   accountId: "gmail",

@@ -2,13 +2,16 @@ import { describe, expect, it, vi } from "vitest";
 import { Archive } from "../src/archive.js";
 import { normalizeMessage } from "../src/normalize.js";
 
-vi.mock("../src/embedding.js", () => ({
-  createEmbedder: async () => ({
-    embedDocuments: async (texts: string[]) => texts.map((text) => text.includes("old attachment") ? [1, 0] : [0, 1]),
-    embedQuery: async (query: string) => query.includes("old attachment") ? [1, 0] : [0, 1],
-  }),
-  embeddingModelName: () => "test-model",
-}));
+vi.mock("../src/embedding.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/embedding.js")>();
+  return {
+    ...actual,
+    createEmbedder: async () => ({
+      embedDocuments: async (texts: string[]) => texts.map((text) => text.includes("old attachment") ? [1, 0] : [0, 1]),
+      embedQuery: async (query: string) => query.includes("old attachment") ? [1, 0] : [0, 1],
+    }),
+  };
+});
 
 const message = (attachmentText: string) => ({
   accountId: "gmail",
@@ -60,12 +63,11 @@ describe("issue 13: attachment-only updates", () => {
     expect(await archive.searchBm25("old attachment")).toHaveLength(0);
     expect(await archive.searchBm25("new attachment")).toHaveLength(1);
     expect(await archive.searchSemantic("old attachment")).toHaveLength(0);
-    expect(archive.db.prepare("SELECT chunk_id FROM semantic_vectors WHERE chunk_id = ?").get(oldChunk.chunk_id)).toBeUndefined();
     expect(archive.db.prepare("SELECT chunk_id FROM embedding_queue WHERE chunk_id = ?").get(oldChunk.chunk_id)).toBeUndefined();
     expect(archive.db.prepare("SELECT state, content_hash FROM embedding_queue WHERE chunk_id = ?").get(newChunk.chunk_id)).toEqual({ state: "pending", content_hash: newChunk.content_hash });
 
     expect(await archive.indexSemantic()).toMatchObject({ embedded: 1, reused: 0 });
-    expect(archive.db.prepare("SELECT chunk_id, content_hash FROM semantic_vectors").all()).toEqual([newChunk]);
+    expect(await archive.searchSemantic("new attachment")).toHaveLength(1);
     archive.close();
   });
 });

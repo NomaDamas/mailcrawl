@@ -161,10 +161,11 @@ change, mailcrawl clears those fields and marks them stale. The next complete
 commits the new fingerprint atomically. Multilingual search fails clearly until
 that sync completes; the default Unicode FTS remains independent.
 
-Semantic vectors are separate derived artifacts. Changing the embedding model
-or its preprocessing requires a new semantic generation; run `mailcrawl index`
-after synchronization. Existing lexical fields remain valid when only the
-embedding model changes.
+Semantic vectors are separate derived artifacts stored in the LanceDB table
+at `<data-dir>/semantic.lance`. Changing the embedding model or its
+preprocessing changes the persisted embedder identity; the next
+`mailcrawl index` discards the vector table and re-embeds everything. Existing
+lexical fields remain valid when only the embedding model changes.
 
 ## Packaging and licenses
 

@@ -1,6 +1,6 @@
 {
   "name": "@nomadamas/mailcrawl",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Local Himalaya-backed incremental email indexing and hybrid search CLI",
   "license": "MIT",
   "type": "module",
@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
+    "@lancedb/lancedb": "^0.39.0",
     "better-sqlite3": "^12.4.1",
     "commander": "^14.0.0",
     "kiwi-nlp": "^0.23.0",
