@@ -182,7 +182,10 @@ program
     try {
       let semantic: unknown = "missing";
       try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
-      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
+      catch (error) {
+        const status = semanticErrorStatus(error);
+        semantic = redactDiagnostic({ status: status === "missing" ? semanticMissingStatus(archive) : status, error: error instanceof Error ? error.message : String(error) });
+      }
       const semanticCommitted = typeof semantic === "object" && semantic !== null && "generation" in semantic;
       output({
         name: "mailcrawl",
@@ -209,7 +212,10 @@ program
     try {
       let semantic: unknown = "missing";
       try { semantic = semanticStatus(archive, archive.semanticGeneration(join(dataDir, "semantic"))); }
-      catch (error) { semantic = redactDiagnostic({ status: semanticErrorStatus(error), error: error instanceof Error ? error.message : String(error) }); }
+      catch (error) {
+        const status = semanticErrorStatus(error);
+        semantic = redactDiagnostic({ status: status === "missing" ? semanticMissingStatus(archive) : status, error: error instanceof Error ? error.message : String(error) });
+      }
       output({ name: "mailcrawl", archive: archivePath, archivePresent: true, ...archive.status(), semantic }, options.json);
     } finally { archive.close(); }
   });
@@ -286,6 +292,11 @@ function semanticStatus(archive: Archive, semantic: { generation: string; archiv
 }
 function semanticErrorStatus(error: unknown): "missing" | "corrupt" {
   return error instanceof Error && "code" in error && error.code === "ENOENT" ? "missing" : "corrupt";
+}
+function semanticMissingStatus(archive: Archive): "missing" | "interrupted" | "never-completed" {
+  const { embeddingBacklog, vectorCount } = archive.status();
+  if (embeddingBacklog === 0) return "missing";
+  return vectorCount > 0 ? "interrupted" : "never-completed";
 }
 function output(value: unknown, json?: boolean): void {
   if (json) console.log(JSON.stringify(value));

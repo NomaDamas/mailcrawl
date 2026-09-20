@@ -10,6 +10,7 @@ import { createEmbedder, embeddingModelName, type Embedder } from "./embedding.j
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
 
 const RETAINED_SEMANTIC_GENERATIONS = 2;
+const EMBEDDING_BATCH_SIZE = 32;
 const SEMANTIC_GENERATION_NAME = /^gen-[0-9a-f]{16}-[0-9]+(?:-[0-9a-f]+)?$/;
 
 export class Archive {
@@ -46,7 +47,7 @@ export class Archive {
     return this.runExclusive(() => this.syncUnlocked(messages, policy));
   }
 
-  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
+  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; vectorCount: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
     const count = (table: "messages" | "chunks"): number =>
       Number((this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
     const ftsRows = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks_fts").get() as { count: number }).count);
@@ -56,6 +57,7 @@ export class Archive {
       messageCount: count("messages"),
       chunkCount,
       embeddingBacklog: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count),
+      vectorCount: Number((this.db.prepare("SELECT COUNT(*) AS count FROM semantic_vectors").get() as { count: number }).count),
       archiveRevision: this.revision(),
       fts: { status: metadata?.version === LEXICAL_ANALYZER_VERSION && ftsRows === chunkCount ? "healthy" : "stale", rows: ftsRows },
     };
@@ -167,38 +169,45 @@ export class Archive {
         WHERE chunk_id NOT IN (SELECT chunk_id FROM embedding_queue)`).run();
     });
     reconcile();
-    const rows = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id").all() as {
-      chunk_id: string; text: string; content_hash: string;
-    }[];
     let embedded = 0;
     let reused = 0;
     const upsert = this.db.prepare(`INSERT INTO semantic_vectors
       (chunk_id, content_hash, model, vector) VALUES (?, ?, ?, ?)
       ON CONFLICT(chunk_id) DO UPDATE SET content_hash=excluded.content_hash, model=excluded.model, vector=excluded.vector`);
-    const pending: typeof rows = [];
-    const transaction = this.db.transaction(() => {
-      for (const row of rows) {
-        const old = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?").get(row.chunk_id) as { content_hash: string; model: string } | undefined;
-        if (old?.content_hash === row.content_hash && old.model === embeddingModelName(this.embedderConfig)) {
-          completeQueueRow.run(row.chunk_id);
-          reused++;
-          continue;
+    const pageQuery = this.db.prepare("SELECT chunk_id, text, content_hash FROM chunks ORDER BY chunk_id LIMIT ? OFFSET ?");
+    const vectorQuery = this.db.prepare("SELECT content_hash, model FROM semantic_vectors WHERE chunk_id = ?");
+    const model = embeddingModelName(this.embedderConfig);
+    let embedder: Embedder | undefined;
+    for (let offset = 0; ; offset += EMBEDDING_BATCH_SIZE) {
+      const rows = pageQuery.all(EMBEDDING_BATCH_SIZE, offset) as {
+        chunk_id: string; text: string; content_hash: string;
+      }[];
+      if (!rows.length) break;
+      const batch: typeof rows = [];
+      const classify = this.db.transaction(() => {
+        for (const row of rows) {
+          const old = vectorQuery.get(row.chunk_id) as { content_hash: string; model: string } | undefined;
+          if (old?.content_hash === row.content_hash && old.model === model) {
+            completeQueueRow.run(row.chunk_id);
+            reused++;
+            continue;
+          }
+          batch.push(row);
         }
-        pending.push(row);
-      }
-    });
-    transaction();
-    if (!pending.length) return { embedded, reused, archiveRevision: this.revision() };
-    const embedder = await this.getEmbedder();
-    const vectors = await embedder.embedDocuments(pending.map((row) => row.text));
-    const write = this.db.transaction(() => {
-      for (const [index, row] of pending.entries()) {
-        upsert.run(row.chunk_id, row.content_hash, embeddingModelName(this.embedderConfig), JSON.stringify(vectors[index]));
-        completeQueueRow.run(row.chunk_id);
-        embedded++;
-      }
-    });
-    write();
+      });
+      classify();
+      if (!batch.length) continue;
+      embedder ??= await this.getEmbedder();
+      const vectors = await embedder.embedDocuments(batch.map((row) => row.text));
+      const write = this.db.transaction(() => {
+        for (const [index, row] of batch.entries()) {
+          upsert.run(row.chunk_id, row.content_hash, model, JSON.stringify(vectors[index]));
+          completeQueueRow.run(row.chunk_id);
+          embedded++;
+        }
+      });
+      write();
+    }
     return { embedded, reused, archiveRevision: this.revision() };
   }
 
