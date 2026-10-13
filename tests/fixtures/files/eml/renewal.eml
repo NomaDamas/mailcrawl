@@ -1,0 +1,20 @@
+Message-ID: <renewal-1@example.com>
+Date: Wed, 26 Aug 2026 10:00:00 +0000
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Cc: Carol <carol@example.com>
+Subject: Contract renewal
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b1"
+
+--b1
+Content-Type: text/plain; charset=utf-8
+
+The contract renewal condition is ready for review.
+
+--b1
+Content-Type: text/plain; charset=utf-8; name="terms.txt"
+Content-Disposition: attachment; filename="terms.txt"
+
+Renewal terms: twelve months, net thirty.
+--b1--

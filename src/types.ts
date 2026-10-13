@@ -174,3 +174,52 @@ export interface SourceReadResult {
 export interface ClassificationPolicy {
   excludedCategories?: string[];
 }
+
+/** Stored change-detection state for one file under one files-source root. */
+export interface SourceFileState {
+  size: number;
+  mtimeMs: number;
+  /** Per-message failures from the last read; re-reported while the file is unchanged. */
+  failures: SourceReadFailure[];
+  /** Content keys of the mbox entries that failed to parse in the last read. */
+  failedEntries: string[];
+}
+
+/** Per-file outcome of one files-source scan. */
+export interface SourceFileSnapshot {
+  rootKey: string;
+  relPath: string;
+  size: number;
+  mtimeMs: number;
+  /** False when size and mtime match the stored state; the file was not re-read. */
+  changed: boolean;
+  /**
+   * `complete`: the read is authoritative and the file's message set is
+   * replaced. This includes mbox reads whose only failures are entries that
+   * already failed last time (same bytes), and malformed `.eml` files.
+   * `partial`: an mbox entry failed that did not fail before; it may be a
+   * previously indexed message, so read messages join the file's message set
+   * but none are removed. `unreadable`: the file itself could not be read;
+   * nothing is removed and no state is stored, so the next sync retries it.
+   */
+  status: "complete" | "partial" | "unreadable";
+  /** Unscoped provider keys of every message read from this file, duplicates included. */
+  messages: Array<{ mailbox: string; providerKey: string }>;
+  /** Failures from this read, or the stored ones re-reported for an unchanged file. */
+  failures: SourceReadFailure[];
+  /** Content keys of the mbox entries that failed to parse in this read. */
+  failedEntries: string[];
+}
+
+/** Complete snapshot of the files-source roots scanned by one sync. */
+export interface FilesSnapshot {
+  accountId: string;
+  /** Every stored file under these roots that is absent from `files` was removed from disk. */
+  rootKeys: string[];
+  files: SourceFileSnapshot[];
+}
+
+export interface SyncOptions extends ClassificationPolicy {
+  /** Files-source snapshot: reconciles per-file state and deletes messages whose files or mbox entries disappeared. */
+  files?: FilesSnapshot;
+}

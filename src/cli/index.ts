@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
+import { FilesSource } from "../files-source.js";
 import type { EmbedderConfig, SearchFilters } from "../types.js";
 import { redactDiagnostic } from "../redact.js";
 import { inspectKoreanAnalyzer, resolveKiwiModelDir } from "../kiwi-runtime.js";
@@ -19,10 +20,11 @@ program.option("--data-dir <path>", "archive directory", process.env.MAILCRAWL_D
 
 program
   .command("sync")
-  .option("--source <source>", "fixture or himalaya", "himalaya")
+  .option("--source <source>", "fixture, himalaya, or files", "himalaya")
   .option("--fixture <path>")
-  .option("--account <name>")
-  .option("--mailbox <name>", "mailbox name", "INBOX")
+  .option("--path <path>", "files source: .eml file, .mbox/.mbx archive, or directory (repeatable)", (value: string, previous: string[]) => previous.concat(value), [])
+  .option("--account <name>", "account id (files source: defaults to the first --path name)")
+  .option("--mailbox <name>", "mailbox name (himalaya: INBOX; files: mbox file name or .eml directory name)")
   .option("--backend <name>")
   .option("--page-size <n>", "envelopes per page", "1000")
   .option("--concurrency <n>", "simultaneous message reads (default 4)")
@@ -32,17 +34,31 @@ program
   .option("--json")
   .action(async (options: SyncOptions, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
-    if (options.source !== "fixture" && options.source !== "himalaya") throw new Error(`unsupported source: ${options.source}`);
+    if (!["fixture", "himalaya", "files"].includes(options.source)) throw new Error(`unsupported source: ${options.source}`);
     if (options.source === "fixture" && !options.fixture) throw new Error("--fixture is required for fixture source");
     if (options.source === "himalaya" && !options.account) throw new Error("--account is required for himalaya source");
+    if (options.source === "files" && options.path.length === 0) throw new Error("--path is required for files source");
     await mkdir(dataDir, { recursive: true });
     const archive = new Archive(join(dataDir, "archive.sqlite"));
     try {
+      const excludedCategories = (options.excludeCategory.length ? options.excludeCategory : ["spam", "promotions"])
+        .filter((category) => !options.includeCategory.includes(category));
+      if (options.source === "files") {
+        const source = new FilesSource({
+          paths: options.path, account: options.account, mailbox: options.mailbox,
+          previous: (rootKey) => archive.sourceFileStates(rootKey, excludedCategories),
+        });
+        const { messages, failures, duplicates, snapshot } = await source.collect();
+        if (messages.length === 0 && failures.length > 0 && snapshot.files.every((file) => file.changed && file.messages.length === 0)) {
+          throw new Error(`source read failed for all ${failures.length} message(s); no messages could be read: ${failures.slice(0, 3).map((failure) => failure.providerKey).join(", ")}`);
+        }
+        const report = await archive.sync(messages, { excludedCategories, files: snapshot });
+        output({ ...report, account: source.account, files: snapshot.files.length, filesRead: snapshot.files.filter((file) => file.changed).length, duplicates, failures }, options.json);
+        return;
+      }
       const source = options.source === "fixture"
         ? fixtureSource(options)
         : himalayaSource(options);
-      const excludedCategories = (options.excludeCategory.length ? options.excludeCategory : ["spam", "promotions"])
-        .filter((category) => !options.includeCategory.includes(category));
       const { messages, failures } = await source.collect();
       if (messages.length === 0 && failures.length > 0) {
         throw new Error(`source read failed for all ${failures.length} message(s); no messages could be read: ${failures.slice(0, 3).map((failure) => failure.providerKey).join(", ")}`);
@@ -305,7 +321,7 @@ interface EmbedOptions extends JsonOptions {
   passagePrefix?: string;
   embedTimeout?: string;
 }
-interface SyncOptions extends JsonOptions { source: string; fixture?: string; account?: string; mailbox: string; backend?: string; pageSize: string; concurrency?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
+interface SyncOptions extends JsonOptions { source: string; fixture?: string; path: string[]; account?: string; mailbox?: string; backend?: string; pageSize: string; concurrency?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
 interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };

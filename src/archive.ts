@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ClassificationPolicy, Chunk, EmbedderConfig, EmbedderIdentity, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SyncReport } from "./types.js";
+import type { Chunk, EmbedderConfig, EmbedderIdentity, FilesSnapshot, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SourceFileState, SyncOptions, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { scopedId, snippet } from "./util.js";
@@ -62,8 +62,21 @@ export class Archive {
     this.db.close();
   }
 
-  async sync(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
-    return this.runExclusive(() => this.syncUnlocked(messages, policy));
+  async sync(messages: MailMessage[], options: SyncOptions = {}): Promise<SyncReport> {
+    return this.runExclusive(() => this.syncUnlocked(messages, options));
+  }
+
+  /**
+   * Stored change-detection state for the files under one files-source root.
+   * State recorded under a different exclusion policy is ignored, so a policy
+   * change re-reads the files instead of leaving them excluded.
+   */
+  sourceFileStates(rootKey: string, excludedCategories: string[] = DEFAULT_EXCLUDED_CATEGORIES): Map<string, SourceFileState> {
+    const rows = this.db.prepare("SELECT rel_path, size, mtime_ms, failures, failed_entries FROM source_files WHERE root_key = ? AND policy = ?")
+      .all(rootKey, policyKey(excludedCategories)) as { rel_path: string; size: number; mtime_ms: number; failures: string; failed_entries: string }[];
+    return new Map(rows.map((row) => [row.rel_path, {
+      size: row.size, mtimeMs: row.mtime_ms, failures: JSON.parse(row.failures), failedEntries: JSON.parse(row.failed_entries),
+    }]));
   }
 
   status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; vectorCount: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
@@ -104,11 +117,11 @@ export class Archive {
     return { status: "healthy", ...detail };
   }
 
-  private async syncUnlocked(messages: MailMessage[], policy: ClassificationPolicy = {}): Promise<SyncReport> {
+  private async syncUnlocked(messages: MailMessage[], options: SyncOptions = {}): Promise<SyncReport> {
     for (const message of messages) {
       if (typeof message.providerKey !== "string" || !message.providerKey.trim()) throw new Error("message provider identity is required");
     }
-    const excludedCategories = new Set((policy.excludedCategories ?? ["spam", "promotions"]).map(normalizeCategory));
+    const excludedCategories = new Set((options.excludedCategories ?? DEFAULT_EXCLUDED_CATEGORIES).map(normalizeCategory));
     const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
       ...message,
       messageId: scopedId(message.accountId, message.mailbox, message.messageId),
@@ -161,16 +174,70 @@ export class Archive {
       VALUES (1, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(id) DO UPDATE SET version=excluded.version, rebuilt_at=excluded.rebuilt_at`).run(LEXICAL_ANALYZER_VERSION);
     this.lexicalRebuildRequired = false;
-    for (const message of excluded) this.removeMessage(message);
+    for (const message of excluded) this.removeMessage(message.providerKey);
+    const deleted = options.files ? this.reconcileFiles(options.files, policyKey(options.excludedCategories ?? DEFAULT_EXCLUDED_CATEGORIES)) : 0;
     const chunks = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks").get() as { count: number }).count);
     const backlog = Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count);
     return {
-      added, updated, deleted: 0, unchanged, touchedThreads: touched.size,
+      added, updated, deleted, unchanged, touchedThreads: touched.size,
       rebuiltThreads: touched.size, chunksAdded: chunks, chunksDeleted: 0,
       embeddingBacklog: backlog, archiveRevision: this.revision(),
       excluded: excluded.length,
       excludedByReason: countExcluded(excluded, excludedCategories),
     };
+  }
+
+  /**
+   * Applies a files-source snapshot: records which file holds which message,
+   * stores per-file change-detection state, and deletes every message whose
+   * last holding file (or mbox entry) disappeared. Partial and unreadable
+   * reads never remove a message link.
+   */
+  private reconcileFiles(snapshot: FilesSnapshot, policy: string): number {
+    const reconcile = this.db.transaction(() => {
+      const released = new Set<string>();
+      const linksOf = this.db.prepare("SELECT provider_key FROM source_file_messages WHERE root_key = ? AND rel_path = ?");
+      const dropLinks = this.db.prepare("DELETE FROM source_file_messages WHERE root_key = ? AND rel_path = ?");
+      const dropState = this.db.prepare("DELETE FROM source_files WHERE root_key = ? AND rel_path = ?");
+      const addLink = this.db.prepare("INSERT OR IGNORE INTO source_file_messages(root_key, rel_path, provider_key) VALUES (?, ?, ?)");
+      const release = (rootKey: string, relPath: string): void => {
+        for (const row of linksOf.all(rootKey, relPath) as { provider_key: string }[]) released.add(row.provider_key);
+        dropLinks.run(rootKey, relPath);
+      };
+      const present = new Set(snapshot.files.map((file) => `${file.rootKey}\0${file.relPath}`));
+      for (const rootKey of snapshot.rootKeys) {
+        const stored = this.db.prepare(`SELECT rel_path FROM source_files WHERE root_key = ?
+          UNION SELECT rel_path FROM source_file_messages WHERE root_key = ?`).all(rootKey, rootKey) as { rel_path: string }[];
+        for (const { rel_path: relPath } of stored) {
+          if (present.has(`${rootKey}\0${relPath}`)) continue;
+          release(rootKey, relPath);
+          dropState.run(rootKey, relPath);
+        }
+      }
+      const saveState = this.db.prepare(`INSERT INTO source_files(root_key, rel_path, account_id, size, mtime_ms, policy, failures, failed_entries)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(root_key, rel_path) DO UPDATE SET account_id=excluded.account_id, size=excluded.size,
+          mtime_ms=excluded.mtime_ms, policy=excluded.policy, failures=excluded.failures, failed_entries=excluded.failed_entries`);
+      for (const file of snapshot.files) {
+        if (!file.changed) continue;
+        if (file.status === "complete") release(file.rootKey, file.relPath);
+        for (const message of file.messages) {
+          addLink.run(file.rootKey, file.relPath, scopedId(snapshot.accountId, message.mailbox, message.providerKey));
+        }
+        if (file.status === "unreadable") dropState.run(file.rootKey, file.relPath);
+        else saveState.run(file.rootKey, file.relPath, snapshot.accountId, file.size, file.mtimeMs, policy, JSON.stringify(file.failures), JSON.stringify(file.failedEntries));
+      }
+      const stillLinked = this.db.prepare("SELECT 1 FROM source_file_messages WHERE provider_key = ? LIMIT 1");
+      const indexed = this.db.prepare("SELECT 1 FROM messages WHERE provider_key = ?");
+      let deleted = 0;
+      for (const providerKey of released) {
+        if (stillLinked.get(providerKey)) continue;
+        if (indexed.get(providerKey)) deleted++;
+        this.removeMessage(providerKey);
+      }
+      return deleted;
+    });
+    return reconcile();
   }
 
   async searchBm25(query: string, filters: SearchFilters = {}, limit = 10): Promise<SearchHit[]> {
@@ -520,13 +587,13 @@ export class Archive {
     }
   }
 
-  private removeMessage(message: NormalizedMessage): void {
-    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?)").all(message.providerKey) as { rowid: number }[];
+  private removeMessage(providerKey: string): void {
+    const rows = this.db.prepare("SELECT rowid FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?)").all(providerKey) as { rowid: number }[];
     for (const row of rows) this.db.prepare("DELETE FROM chunks_fts WHERE rowid = ?").run(row.rowid);
-    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))`).run(message.providerKey);
-    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(message.providerKey);
+    for (const language of lexicalFields()) this.db.prepare(`DELETE FROM chunks_fts_${language} WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))`).run(providerKey);
+    this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE message_id = (SELECT message_id FROM messages WHERE provider_key = ?))").run(providerKey);
     // Stale vector rows are swept from the Lance table at the next index run.
-    this.db.prepare("DELETE FROM messages WHERE provider_key = ?").run(message.providerKey);
+    this.db.prepare("DELETE FROM messages WHERE provider_key = ?").run(providerKey);
   }
 
   private replaceMessageChunks(message: NormalizedMessage, analyzedChunks?: Map<string, Map<string, string>>): void {
@@ -647,6 +714,20 @@ function migrate(db: Database.Database): void {
   CREATE TABLE IF NOT EXISTS lexical_index_meta (
     id INTEGER PRIMARY KEY CHECK (id = 1), version TEXT NOT NULL, rebuilt_at TEXT NOT NULL
   );
+  -- Files source (issue #41): change-detection state per file under a --path
+  -- root, and which file holds which scoped provider key, so a message is
+  -- deleted only when the last file (or mbox entry) holding it disappears.
+  CREATE TABLE IF NOT EXISTS source_files (
+    root_key TEXT NOT NULL, rel_path TEXT NOT NULL, account_id TEXT NOT NULL,
+    size INTEGER NOT NULL, mtime_ms REAL NOT NULL, policy TEXT NOT NULL,
+    failures TEXT NOT NULL DEFAULT '[]', failed_entries TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (root_key, rel_path)
+  );
+  CREATE TABLE IF NOT EXISTS source_file_messages (
+    root_key TEXT NOT NULL, rel_path TEXT NOT NULL, provider_key TEXT NOT NULL,
+    PRIMARY KEY (root_key, rel_path, provider_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_source_file_messages_provider ON source_file_messages(provider_key);
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     subject, from_address, to_addresses, thread_subject, body_latest,
     body_quoted, forwarded_text, attachment_text,
@@ -690,6 +771,13 @@ function addFilters(clauses: string[], params: unknown[], filters: SearchFilters
   if (filters.threadId) { clauses.push("c.thread_id = ?"); params.push(filters.threadId); }
   if (filters.after) { clauses.push("m.date >= ?"); params.push(filters.after); }
   if (filters.before) { clauses.push("m.date <= ?"); params.push(filters.before); }
+}
+
+const DEFAULT_EXCLUDED_CATEGORIES = ["spam", "promotions"];
+
+/** Canonical form of an exclusion policy, stored with files-source state. */
+function policyKey(excludedCategories: string[]): string {
+  return JSON.stringify([...new Set(excludedCategories.map(normalizeCategory))].sort());
 }
 
 function normalizeCategory(value: string): string {

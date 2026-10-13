@@ -59,6 +59,8 @@ reconciliation:
     sync_cursors
     embedding_queue
     chunks_fts (FTS5)
+    source_files            # files source: size/mtime/failures per file
+    source_file_messages    # files source: which file holds which message
   vectors/
     LanceDB tables keyed by chunk_id and embedding_model
   semantic.lance/           # LanceDB vector table (rebuildable)
@@ -91,6 +93,35 @@ contract:
 - JMAP state token
 - Microsoft Graph delta link
 - Maildir file identity and mtime
+
+### Files source
+
+`--source files` reads `.eml` files and `.mbox`/`.mbx` archives from disk
+(`src/files-source.ts`) instead of Himalaya. It follows the same snapshot-diff
+rules with file state in place of provider cursors:
+
+1. Walk every `--path` root and stat each mail file. A file whose size and
+   mtime match `source_files` is not read; its stored failures are
+   re-reported.
+2. Parse changed files. Provider identity is the `Message-ID` header, or the
+   SHA-256 of the raw message bytes when it is missing. mbox entries are split
+   on `From ` lines that follow a blank line, and one level of `>From `
+   quoting is undone (mboxrd; correct for mboxo too).
+3. Record in `source_file_messages` which file holds which scoped provider
+   key. A completely read file replaces its set, so an mbox entry that
+   disappeared releases its message. An mbox read with a newly failing entry
+   only adds to its set, because the broken entry may be a previously indexed
+   message; an entry that already failed with the same bytes keeps the read
+   authoritative. An unreadable file keeps its set and stores no state, so it
+   is retried.
+4. Delete each released message that no other file still holds; removed
+   files under a scanned root release all their messages.
+
+The root identity includes the account, the `--mailbox` override, and the
+resolved root path; stored state recorded under a different exclusion policy
+is ignored, so changing `--include-category` re-reads the files. Diagnostics
+name files as `<root name>/<relative path>[#entry]` and never include
+absolute paths.
 
 ## Email-aware chunking
 
