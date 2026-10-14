@@ -91,13 +91,18 @@ mailcrawl sync --source files --path ~/Mail/eml-dir/ --json   # recursive
   with no changes reads nothing. A changed mbox is re-read and reconciled by
   identity: appending one message adds exactly that message.
 - Deletion: a message is deleted when the last file (or mbox entry) holding
-  it disappears. Each files sync is authoritative for its `--account`: paths
-  of that account that are no longer passed (a dropped `--path`, a moved or
-  renamed folder, a changed `--mailbox`) are released, so sync every root of
-  an account together. An mbox entry that newly fails to parse never deletes
-  the message it may have been until the entry is fixed or removed; a file or
-  directory that cannot be read, or an mbox with stray bytes before its first
-  `From ` line, keeps its messages and is retried on the next sync.
+  it disappears. With an explicit `--account`, a sync is authoritative for
+  that account: paths of the account that are no longer passed (a dropped
+  `--path`, a moved or renamed folder, a changed `--mailbox`) are released,
+  so sync every root of an account together. The release waits for a sync
+  with no failures, so a moved folder with a broken file keeps the old
+  folder's messages until the file is fixed. Without `--account` (the account
+  is derived from the folder name, so `personal/Takeout` and `work/Takeout`
+  share it), other paths are never released. An mbox entry that newly fails
+  to parse never deletes the message it may have been until the entry is
+  fixed or removed; a file or directory that cannot be read, or an mbox with
+  stray bytes before its first `From ` line, keeps its messages and is
+  retried on the next sync.
 - Limits: messages over 50 MiB are skipped, body text is capped at 1,000,000
   characters, and text attachments over 1 MB keep only their metadata.
 - Failures: unparseable messages are reported in `failures[]` and the rest are

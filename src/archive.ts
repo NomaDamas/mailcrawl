@@ -192,14 +192,17 @@ export class Archive {
    * stores per-file change-detection state, and deletes every message whose
    * last holding file (or mbox entry) disappeared.
    *
-   * - A files sync is authoritative for its account: stored roots of the same
-   *   account that are not in this snapshot (a dropped `--path`, a moved or
-   *   renamed root, a changed `--mailbox`) are released.
    * - Stored files at or below a path that could not be listed are kept.
    * - An unreadable file keeps its links. A partial read replaces the file's
    *   links only when every message the file held is still present; otherwise
    *   a newly broken entry may be one of them, so nothing is released and the
    *   entry stays "new" until it is fixed or deleted.
+   * - With an explicit account (`authoritative`), stored roots of the account
+   *   that are not in this snapshot (a dropped `--path`, a moved or renamed
+   *   root, a changed `--mailbox`) are released, but only by a sync with no
+   *   failure and no unlisted path, stored failures of unchanged files
+   *   included: a broken entry under a moved root may be a message only the
+   *   old root still links. Until then the old root stays registered.
    */
   private reconcileFiles(snapshot: FilesSnapshot, policy: string): number {
     const reconcile = this.db.transaction(() => {
@@ -216,16 +219,6 @@ export class Archive {
       const storedPaths = (rootKey: string): string[] => (this.db.prepare(`SELECT rel_path FROM source_files WHERE root_key = ?
         UNION SELECT rel_path FROM source_file_messages WHERE root_key = ?`).all(rootKey, rootKey) as { rel_path: string }[]).map((row) => row.rel_path);
 
-      const live = new Set(snapshot.rootKeys);
-      const staleRoots = (this.db.prepare("SELECT root_key FROM source_roots WHERE account_id = ?").all(snapshot.accountId) as { root_key: string }[])
-        .map((row) => row.root_key).filter((rootKey) => !live.has(rootKey));
-      for (const rootKey of staleRoots) {
-        for (const relPath of storedPaths(rootKey)) {
-          release(rootKey, relPath);
-          dropState.run(rootKey, relPath);
-        }
-        this.db.prepare("DELETE FROM source_roots WHERE root_key = ?").run(rootKey);
-      }
       const registerRoot = this.db.prepare("INSERT INTO source_roots(root_key, account_id) VALUES (?, ?) ON CONFLICT(root_key) DO UPDATE SET account_id=excluded.account_id");
       for (const rootKey of snapshot.rootKeys) registerRoot.run(rootKey, snapshot.accountId);
 
@@ -244,6 +237,7 @@ export class Archive {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(root_key, rel_path) DO UPDATE SET account_id=excluded.account_id, size=excluded.size,
           mtime_ms=excluded.mtime_ms, policy=excluded.policy, failures=excluded.failures, failed_entries=excluded.failed_entries`);
+      const unsafe = snapshot.unlisted.length > 0 || snapshot.files.some((file) => file.failures.length > 0);
       for (const file of snapshot.files) {
         if (!file.changed) continue;
         const current = file.messages.map((message) => scopedId(snapshot.accountId, message.mailbox, message.providerKey));
@@ -262,6 +256,19 @@ export class Archive {
         for (const providerKey of current) addLink.run(file.rootKey, file.relPath, providerKey);
         if (file.status === "unreadable") dropState.run(file.rootKey, file.relPath);
         else saveState.run(file.rootKey, file.relPath, snapshot.accountId, file.size, file.mtimeMs, policy, JSON.stringify(file.failures), JSON.stringify(failedEntries));
+      }
+
+      if (snapshot.authoritative && !unsafe) {
+        const live = new Set(snapshot.rootKeys);
+        const staleRoots = (this.db.prepare("SELECT root_key FROM source_roots WHERE account_id = ?").all(snapshot.accountId) as { root_key: string }[])
+          .map((row) => row.root_key).filter((rootKey) => !live.has(rootKey));
+        for (const rootKey of staleRoots) {
+          for (const relPath of storedPaths(rootKey)) {
+            release(rootKey, relPath);
+            dropState.run(rootKey, relPath);
+          }
+          this.db.prepare("DELETE FROM source_roots WHERE root_key = ?").run(rootKey);
+        }
       }
       const stillLinked = this.db.prepare("SELECT 1 FROM source_file_messages WHERE provider_key = ? LIMIT 1");
       const indexed = this.db.prepare("SELECT 1 FROM messages WHERE provider_key = ?");

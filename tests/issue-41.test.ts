@@ -35,11 +35,23 @@ async function copyFixtures(): Promise<string> {
   return root;
 }
 
-async function syncFiles(archive: Archive, paths: string[], account = "takeout") {
-  const source = new FilesSource({ paths, account, previous: (rootKey) => archive.sourceFileStates(rootKey) });
+async function syncFiles(archive: Archive, paths: string[], { derivedAccount = false } = {}) {
+  const source = new FilesSource({ paths, account: derivedAccount ? undefined : "takeout", previous: (rootKey) => archive.sourceFileStates(rootKey) });
   const result = await source.collect();
   const report = await archive.sync(result.messages, { files: result.snapshot });
   return { result, report };
+}
+
+/** A root with only well-formed mail: its syncs have no failures, so stale roots can be released. */
+async function cleanRoot(name = "backup"): Promise<string> {
+  const root = await copyFixtures();
+  await rm(join(root, "eml", "malformed.eml"));
+  const mbox = join(root, "takeout.mbox");
+  await writeFile(mbox, (await readFile(mbox, "utf8")).replace(/From broken@example\.com[\s\S]*$/, ""));
+  if (name === "backup") return root;
+  const renamed = join(dirname(root), name);
+  await rename(root, renamed);
+  return renamed;
 }
 
 const messageKey = (mailbox: string, messageId: string) => scopedId("takeout", mailbox, messageId);
@@ -169,8 +181,8 @@ describe("issue 41: files source", () => {
     archive.close();
   });
 
-  it("treats a files sync as authoritative for its account across moved roots and dropped paths", async () => {
-    const root = await copyFixtures();
+  it("releases a moved root's old links only after a clean sync with an explicit account", async () => {
+    const root = await cleanRoot();
     const archive = new Archive();
     await syncFiles(archive, [root, join(root, "takeout.mbox")]);
     expect(archive.status().messageCount).toBe(5);
@@ -178,13 +190,32 @@ describe("issue 41: files source", () => {
     // Dropping the second --path releases nothing that the first root still holds.
     expect((await syncFiles(archive, [root])).report.deleted).toBe(0);
 
-    // A moved root is a new root; once the old one is released, deletions under the new one take effect.
+    // Moved root with a broken file: the old root must keep pinning its messages.
     const moved = join(dirname(root), "moved");
     await rename(root, moved);
+    const renewal = join(moved, "eml", "renewal.eml");
+    const original = await readFile(renewal);
+    await writeFile(renewal, "not an email\n");
+    expect((await syncFiles(archive, [moved])).report.deleted).toBe(0);
+    expect(archive.getMessage(messageKey("eml", "<renewal-1@example.com>"))).toBeDefined();
+
+    // Fixed: the clean sync releases the old root; later deletions under the new root take effect.
+    await writeFile(renewal, original);
     expect((await syncFiles(archive, [moved])).report).toMatchObject({ added: 0, deleted: 0 });
-    await rm(join(moved, "eml", "renewal.eml"));
+    await rm(renewal);
     expect((await syncFiles(archive, [moved])).report.deleted).toBe(1);
     expect(archive.getMessage(messageKey("eml", "<renewal-1@example.com>"))).toBeUndefined();
+    archive.close();
+  });
+
+  it("never lets unrelated exports with the same folder name delete each other under a derived account", async () => {
+    const personal = await cleanRoot("Takeout");
+    const work = await cleanRoot("Takeout");
+    const archive = new Archive();
+    await syncFiles(archive, [personal], { derivedAccount: true });
+    const { result, report } = await syncFiles(archive, [work], { derivedAccount: true });
+    expect(result.snapshot).toMatchObject({ accountId: "Takeout", authoritative: false });
+    expect(report.deleted).toBe(0);
     archive.close();
   });
 

@@ -220,12 +220,15 @@ export interface UnlistedPath {
 }
 
 /**
- * Complete snapshot of one files sync. A files sync is authoritative for its
- * account: stored roots of `accountId` that are not in `rootKeys` (a dropped
- * `--path`, a moved root, a changed `--mailbox`) are released.
+ * Complete snapshot of one files sync. When `authoritative` (an explicit
+ * `--account`), stored roots of `accountId` that are not in `rootKeys` (a
+ * dropped `--path`, a moved root, a changed `--mailbox`) are released, but
+ * only after a sync with no unsafe read.
  */
 export interface FilesSnapshot {
   accountId: string;
+  /** True only for an explicit account; a derived account never releases other roots. */
+  authoritative: boolean;
   /** Every stored file under these roots that is absent from `files` was removed from disk. */
   rootKeys: string[];
   files: SourceFileSnapshot[];

@@ -119,18 +119,23 @@ rules with file state in place of provider cursors:
    already failed with the same bytes keeps the read authoritative. An
    unreadable file (including an mbox with content before its first `From `
    line) keeps its set and stores no state, so it is retried.
-4. A files sync is authoritative for its account: roots recorded in
-   `source_roots` for the account but absent from this sync release all
-   their files.
+4. With an explicit `--account`, a files sync is authoritative for that
+   account: roots recorded in `source_roots` for the account but absent from
+   this sync release all their files. The release runs only when the sync
+   has no failure (stored failures of unchanged files included) and no
+   unlisted path, because a broken entry under a moved root may be a message
+   that only the old root still links. A derived account (the first `--path`
+   name) never releases other roots, since unrelated exports can share a
+   folder name.
 5. Delete each released message that no other file still holds; removed
    files under a scanned root release all their messages.
 
 The root identity includes the account, the `--mailbox` override, and the
 resolved root path, so moving a root or changing `--mailbox` registers a new
-root and releases the old one. Stored state recorded under a different
-exclusion policy is ignored, so changing `--include-category` re-reads the
-files. Diagnostics name files as `<root name>/<relative path>[#entry]` and
-never include absolute paths.
+root, and the old one is released by the next clean authoritative sync.
+Stored state recorded under a different exclusion policy is ignored, so
+changing `--include-category` re-reads the files. Diagnostics name files as
+`<root name>/<relative path>[#entry]` and never include absolute paths.
 
 ## Email-aware chunking
 
