@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { appendFile, cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -122,11 +122,12 @@ describe("issue 41: files source", () => {
     archive.close();
   });
 
-  it("keeps an indexed mbox message whose entry becomes unparseable", async () => {
+  it("keeps an indexed mbox message whose entry becomes unparseable, across later appends", async () => {
     const root = await copyFixtures();
     const mbox = join(root, "takeout.mbox");
     const archive = new Archive();
     await syncFiles(archive, [root]);
+    const reply = messageKey("takeout", "<thread-2@example.com>");
 
     const text = await readFile(mbox, "utf8");
     const broken = text.replace(/Message-ID: <thread-2@example\.com>[\s\S]*?\r?\n\r?\n/, "garbage instead of headers\n\n");
@@ -134,8 +135,91 @@ describe("issue 41: files source", () => {
     const { result, report } = await syncFiles(archive, [root]);
     expect(report.deleted).toBe(0);
     expect(result.failures.map((failure) => failure.providerKey)).toContain("backup/takeout.mbox#2");
-    expect(archive.getMessage(messageKey("takeout", "<thread-2@example.com>"))).toBeDefined();
+    expect(archive.getMessage(reply)).toBeDefined();
+
+    // The common next change to a live mbox is an append; it must not delete the message either.
+    await appendFile(mbox, APPENDED);
+    expect((await syncFiles(archive, [root])).report).toMatchObject({ added: 1, deleted: 0 });
+    expect(archive.getMessage(reply)).toBeDefined();
+
+    // Removing the broken entry for good releases the message.
+    await writeFile(mbox, broken.replace(/From bob@example\.com[\s\S]*?\n\n(?=From )/, "") + APPENDED);
+    expect((await syncFiles(archive, [root])).report.deleted).toBe(1);
+    expect(archive.getMessage(reply)).toBeUndefined();
     archive.close();
+  });
+
+  it("keeps every message of an indexed mbox whose head gains stray bytes", async () => {
+    const root = await copyFixtures();
+    const mbox = join(root, "takeout.mbox");
+    const archive = new Archive();
+    await syncFiles(archive, [root]);
+    const original = await readFile(mbox);
+
+    await writeFile(mbox, Buffer.concat([Buffer.from("stray line before the first separator\n"), original]));
+    const stray = await syncFiles(archive, [root]);
+    expect(stray.report.deleted).toBe(0);
+    expect(stray.result.failures.map((failure) => failure.error)).toContain("not an mbox file: content before the first From_ separator");
+    expect(archive.status().messageCount).toBe(5);
+
+    // An editor-added UTF-8 BOM is not stray content.
+    await writeFile(mbox, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), original]));
+    expect((await syncFiles(archive, [root])).report).toMatchObject({ added: 0, deleted: 0 });
+    expect(archive.status().messageCount).toBe(5);
+    archive.close();
+  });
+
+  it("treats a files sync as authoritative for its account across moved roots and dropped paths", async () => {
+    const root = await copyFixtures();
+    const archive = new Archive();
+    await syncFiles(archive, [root, join(root, "takeout.mbox")]);
+    expect(archive.status().messageCount).toBe(5);
+
+    // Dropping the second --path releases nothing that the first root still holds.
+    expect((await syncFiles(archive, [root])).report.deleted).toBe(0);
+
+    // A moved root is a new root; once the old one is released, deletions under the new one take effect.
+    const moved = join(dirname(root), "moved");
+    await rename(root, moved);
+    expect((await syncFiles(archive, [moved])).report).toMatchObject({ added: 0, deleted: 0 });
+    await rm(join(moved, "eml", "renewal.eml"));
+    expect((await syncFiles(archive, [moved])).report.deleted).toBe(1);
+    expect(archive.getMessage(messageKey("eml", "<renewal-1@example.com>"))).toBeUndefined();
+    archive.close();
+  });
+
+  it("reports an unlistable directory without aborting or deleting what it held", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const root = await copyFixtures();
+    const archive = new Archive();
+    await syncFiles(archive, [root]);
+
+    await chmod(join(root, "eml"), 0o000);
+    try {
+      const { result, report } = await syncFiles(archive, [root]);
+      expect(report.deleted).toBe(0);
+      expect(result.failures).toContainEqual(expect.objectContaining({ providerKey: "backup/eml", error: "directory cannot be read (EACCES)" }));
+      expect(JSON.stringify(result.failures)).not.toContain(dirname(root));
+      expect(archive.status().messageCount).toBe(5);
+    } finally {
+      await chmod(join(root, "eml"), 0o755);
+    }
+    archive.close();
+  });
+
+  it("reads an Apple Mail export bundle and ignores an empty Message-ID", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mailcrawl-issue-41-bundle-"));
+    scratch.push(dir);
+    const bundle = join(dir, "Inbox.mbox");
+    await mkdir(bundle);
+    const entry = (body: string) => `From a@example.com Sat Aug 29 07:30:00 2026\nMessage-ID: <>\nFrom: a@example.com\nSubject: ${body}\n\n${body}\n\n`;
+    await writeFile(join(bundle, "mbox"), entry("first") + entry("second"));
+    await writeFile(join(bundle, "table_of_contents"), "binary index");
+
+    const { result, report } = await syncFiles(new Archive(), [bundle]);
+    expect(result.messages.map((message) => [message.mailbox, message.subject])).toEqual([["Inbox", "first"], ["Inbox", "second"]]);
+    expect(result.duplicates).toEqual([]);
+    expect(report.added).toBe(2);
   });
 
   it("makes a CJK message searchable through BM25 and hybrid search", async () => {

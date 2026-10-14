@@ -82,8 +82,10 @@ mailcrawl sync --source files --path ./eml-dir --json
 `--path` is repeatable and `--account` defaults to the first path name.
 Re-running is incremental: unchanged files are not read, appended mbox
 messages are added, and messages whose files or mbox entries were removed are
-deleted. Unparseable messages appear in `failures[]` by root-relative label;
-the rest are indexed.
+deleted. Each files sync is authoritative for its account, so pass every
+`--path` of an account in the same command; paths left out are treated as
+removed. Unparseable messages and unreadable directories appear in
+`failures[]` by root-relative label; the rest are indexed.
 
 Use a fixture for deterministic development:
 

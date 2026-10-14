@@ -194,13 +194,14 @@ export interface SourceFileSnapshot {
   /** False when size and mtime match the stored state; the file was not re-read. */
   changed: boolean;
   /**
-   * `complete`: the read is authoritative and the file's message set is
-   * replaced. This includes mbox reads whose only failures are entries that
-   * already failed last time (same bytes), and malformed `.eml` files.
-   * `partial`: an mbox entry failed that did not fail before; it may be a
-   * previously indexed message, so read messages join the file's message set
-   * but none are removed. `unreadable`: the file itself could not be read;
-   * nothing is removed and no state is stored, so the next sync retries it.
+   * `complete`: every message was read, or the only failures are mbox entries
+   * that already failed with the same bytes; the file's message set is
+   * replaced. `partial`: an mbox entry newly failed to parse. The archive
+   * replaces the set only when no previously held message is missing from
+   * this read; otherwise the broken entry may be that message, so nothing is
+   * removed until the entry is fixed or deleted. `unreadable`: the file could
+   * not be read or is not an mbox; nothing is removed and no state is stored,
+   * so the next sync retries it.
    */
   status: "complete" | "partial" | "unreadable";
   /** Unscoped provider keys of every message read from this file, duplicates included. */
@@ -211,12 +212,24 @@ export interface SourceFileSnapshot {
   failedEntries: string[];
 }
 
-/** Complete snapshot of the files-source roots scanned by one sync. */
+/** A directory or file under a root that could not be listed or stat'ed; stored files at or below it are not treated as removed. */
+export interface UnlistedPath {
+  rootKey: string;
+  /** Root-relative path; `""` is the root itself. */
+  relPath: string;
+}
+
+/**
+ * Complete snapshot of one files sync. A files sync is authoritative for its
+ * account: stored roots of `accountId` that are not in `rootKeys` (a dropped
+ * `--path`, a moved root, a changed `--mailbox`) are released.
+ */
 export interface FilesSnapshot {
   accountId: string;
   /** Every stored file under these roots that is absent from `files` was removed from disk. */
   rootKeys: string[];
   files: SourceFileSnapshot[];
+  unlisted: UnlistedPath[];
 }
 
 export interface SyncOptions extends ClassificationPolicy {

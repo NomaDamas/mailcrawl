@@ -190,8 +190,16 @@ export class Archive {
   /**
    * Applies a files-source snapshot: records which file holds which message,
    * stores per-file change-detection state, and deletes every message whose
-   * last holding file (or mbox entry) disappeared. Partial and unreadable
-   * reads never remove a message link.
+   * last holding file (or mbox entry) disappeared.
+   *
+   * - A files sync is authoritative for its account: stored roots of the same
+   *   account that are not in this snapshot (a dropped `--path`, a moved or
+   *   renamed root, a changed `--mailbox`) are released.
+   * - Stored files at or below a path that could not be listed are kept.
+   * - An unreadable file keeps its links. A partial read replaces the file's
+   *   links only when every message the file held is still present; otherwise
+   *   a newly broken entry may be one of them, so nothing is released and the
+   *   entry stays "new" until it is fixed or deleted.
    */
   private reconcileFiles(snapshot: FilesSnapshot, policy: string): number {
     const reconcile = this.db.transaction(() => {
@@ -200,32 +208,60 @@ export class Archive {
       const dropLinks = this.db.prepare("DELETE FROM source_file_messages WHERE root_key = ? AND rel_path = ?");
       const dropState = this.db.prepare("DELETE FROM source_files WHERE root_key = ? AND rel_path = ?");
       const addLink = this.db.prepare("INSERT OR IGNORE INTO source_file_messages(root_key, rel_path, provider_key) VALUES (?, ?, ?)");
+      const storedFailedEntries = this.db.prepare("SELECT failed_entries FROM source_files WHERE root_key = ? AND rel_path = ?");
       const release = (rootKey: string, relPath: string): void => {
         for (const row of linksOf.all(rootKey, relPath) as { provider_key: string }[]) released.add(row.provider_key);
         dropLinks.run(rootKey, relPath);
       };
+      const storedPaths = (rootKey: string): string[] => (this.db.prepare(`SELECT rel_path FROM source_files WHERE root_key = ?
+        UNION SELECT rel_path FROM source_file_messages WHERE root_key = ?`).all(rootKey, rootKey) as { rel_path: string }[]).map((row) => row.rel_path);
+
+      const live = new Set(snapshot.rootKeys);
+      const staleRoots = (this.db.prepare("SELECT root_key FROM source_roots WHERE account_id = ?").all(snapshot.accountId) as { root_key: string }[])
+        .map((row) => row.root_key).filter((rootKey) => !live.has(rootKey));
+      for (const rootKey of staleRoots) {
+        for (const relPath of storedPaths(rootKey)) {
+          release(rootKey, relPath);
+          dropState.run(rootKey, relPath);
+        }
+        this.db.prepare("DELETE FROM source_roots WHERE root_key = ?").run(rootKey);
+      }
+      const registerRoot = this.db.prepare("INSERT INTO source_roots(root_key, account_id) VALUES (?, ?) ON CONFLICT(root_key) DO UPDATE SET account_id=excluded.account_id");
+      for (const rootKey of snapshot.rootKeys) registerRoot.run(rootKey, snapshot.accountId);
+
       const present = new Set(snapshot.files.map((file) => `${file.rootKey}\0${file.relPath}`));
+      const unlisted = (rootKey: string, relPath: string): boolean => snapshot.unlisted.some((entry) => entry.rootKey === rootKey
+        && (entry.relPath === "" || relPath === entry.relPath || relPath.startsWith(`${entry.relPath}/`)));
       for (const rootKey of snapshot.rootKeys) {
-        const stored = this.db.prepare(`SELECT rel_path FROM source_files WHERE root_key = ?
-          UNION SELECT rel_path FROM source_file_messages WHERE root_key = ?`).all(rootKey, rootKey) as { rel_path: string }[];
-        for (const { rel_path: relPath } of stored) {
-          if (present.has(`${rootKey}\0${relPath}`)) continue;
+        for (const relPath of storedPaths(rootKey)) {
+          if (present.has(`${rootKey}\0${relPath}`) || unlisted(rootKey, relPath)) continue;
           release(rootKey, relPath);
           dropState.run(rootKey, relPath);
         }
       }
+
       const saveState = this.db.prepare(`INSERT INTO source_files(root_key, rel_path, account_id, size, mtime_ms, policy, failures, failed_entries)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(root_key, rel_path) DO UPDATE SET account_id=excluded.account_id, size=excluded.size,
           mtime_ms=excluded.mtime_ms, policy=excluded.policy, failures=excluded.failures, failed_entries=excluded.failed_entries`);
       for (const file of snapshot.files) {
         if (!file.changed) continue;
+        const current = file.messages.map((message) => scopedId(snapshot.accountId, message.mailbox, message.providerKey));
+        let failedEntries = file.failedEntries;
         if (file.status === "complete") release(file.rootKey, file.relPath);
-        for (const message of file.messages) {
-          addLink.run(file.rootKey, file.relPath, scopedId(snapshot.accountId, message.mailbox, message.providerKey));
+        else if (file.status === "partial") {
+          const reread = new Set(current);
+          const missing = (linksOf.all(file.rootKey, file.relPath) as { provider_key: string }[]).some((row) => !reread.has(row.provider_key));
+          if (!missing) release(file.rootKey, file.relPath);
+          else {
+            // Keep the newly broken entries "new" so the next read is partial too.
+            const stored = storedFailedEntries.get(file.rootKey, file.relPath) as { failed_entries: string } | undefined;
+            failedEntries = stored ? JSON.parse(stored.failed_entries) as string[] : [];
+          }
         }
+        for (const providerKey of current) addLink.run(file.rootKey, file.relPath, providerKey);
         if (file.status === "unreadable") dropState.run(file.rootKey, file.relPath);
-        else saveState.run(file.rootKey, file.relPath, snapshot.accountId, file.size, file.mtimeMs, policy, JSON.stringify(file.failures), JSON.stringify(file.failedEntries));
+        else saveState.run(file.rootKey, file.relPath, snapshot.accountId, file.size, file.mtimeMs, policy, JSON.stringify(file.failures), JSON.stringify(failedEntries));
       }
       const stillLinked = this.db.prepare("SELECT 1 FROM source_file_messages WHERE provider_key = ? LIMIT 1");
       const indexed = this.db.prepare("SELECT 1 FROM messages WHERE provider_key = ?");
@@ -726,6 +762,10 @@ function migrate(db: Database.Database): void {
   CREATE TABLE IF NOT EXISTS source_file_messages (
     root_key TEXT NOT NULL, rel_path TEXT NOT NULL, provider_key TEXT NOT NULL,
     PRIMARY KEY (root_key, rel_path, provider_key)
+  );
+  -- Roots seen per account; a files sync releases the account's roots it no longer scans.
+  CREATE TABLE IF NOT EXISTS source_roots (
+    root_key TEXT PRIMARY KEY, account_id TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_source_file_messages_provider ON source_file_messages(provider_key);
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(

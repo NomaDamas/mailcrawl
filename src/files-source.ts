@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { simpleParser, type AddressObject, type ParsedMail } from "mailparser";
-import type { FilesSnapshot, MailMessage, SourceFileSnapshot, SourceFileState, SourceReadFailure, SourceReadResult } from "./types.js";
+import type { FilesSnapshot, MailMessage, SourceFileSnapshot, SourceFileState, SourceReadFailure, SourceReadResult, UnlistedPath } from "./types.js";
 import type { MailSource } from "./source.js";
 import { parsedAttachments } from "./normalize.js";
 import { makeId } from "./util.js";
@@ -15,6 +15,16 @@ export const MAX_MESSAGE_BYTES = 50 * 1024 * 1024;
 export const MAX_BODY_CHARS = 1_000_000;
 
 const MAIL_KIND_BY_EXTENSION: Record<string, "eml" | "mbox"> = { ".eml": "eml", ".mbox": "mbox", ".mbx": "mbox" };
+
+/**
+ * `.eml` → eml; `.mbox`/`.mbx` → mbox; and the extensionless `mbox` file inside
+ * an Apple Mail export bundle (`Inbox.mbox/mbox`) → mbox.
+ */
+function mailKind(path: string): "eml" | "mbox" | undefined {
+  const extension = extname(path).toLowerCase();
+  if (Object.hasOwn(MAIL_KIND_BY_EXTENSION, extension)) return MAIL_KIND_BY_EXTENSION[extension];
+  return basename(path) === "mbox" && extname(dirname(path)).toLowerCase() === ".mbox" ? "mbox" : undefined;
+}
 
 export interface FilesReadResult extends SourceReadResult {
   snapshot: FilesSnapshot;
@@ -32,7 +42,8 @@ export interface FilesSourceOptions {
 }
 
 /**
- * Reads `.eml` files and `.mbox`/`.mbx` archives from disk.
+ * Reads `.eml` files and `.mbox`/`.mbx` archives (including Apple Mail
+ * `X.mbox/mbox` bundles) from disk.
  *
  * Provider identity is the `Message-ID` header, or the SHA-256 of the raw
  * message bytes when the header is missing, so a re-sync of unchanged mail is
@@ -55,6 +66,7 @@ export class FilesSource implements MailSource {
     const duplicates: string[] = [];
     const files: SourceFileSnapshot[] = [];
     const rootKeys: string[] = [];
+    const unlisted: UnlistedPath[] = [];
     const seen = new Set<string>();
     for (const input of this.options.paths) {
       const root = await resolveRoot(input);
@@ -63,7 +75,12 @@ export class FilesSource implements MailSource {
       const rootKey = makeId(this.account, this.options.mailbox ?? "", root.path);
       rootKeys.push(rootKey);
       const previous = this.options.previous?.(rootKey) ?? new Map<string, SourceFileState>();
-      for (const file of await listMailFiles(root)) {
+      const listing = await listMailFiles(root);
+      for (const failure of listing.failures) {
+        unlisted.push({ rootKey, relPath: failure.relPath });
+        failures.push({ providerKey: failure.label, attempts: 1, error: failure.error });
+      }
+      for (const file of listing.files) {
         const stored = previous.get(file.relPath);
         const changed = !stored || stored.size !== file.size || stored.mtimeMs !== file.mtimeMs;
         const snapshot: SourceFileSnapshot = {
@@ -77,8 +94,10 @@ export class FilesSource implements MailSource {
           failures.push(...stored.failures);
           continue;
         }
+        // mbox: file stem, or the bundle stem for Apple Mail `Inbox.mbox/mbox`; eml: holding directory.
+        const mboxPath = basename(file.path) === "mbox" ? dirname(file.path) : file.path;
         const mailbox = this.options.mailbox
-          ?? (file.kind === "mbox" ? basename(file.path, extname(file.path)) || "files" : basename(dirname(file.path)));
+          ?? (file.kind === "eml" ? basename(dirname(file.path)) : basename(mboxPath, extname(mboxPath)) || "files");
         const accept = (entry: ReadEntry): void => {
           if ("error" in entry) {
             // A malformed .eml holds no other message, so its previous message is
@@ -108,7 +127,7 @@ export class FilesSource implements MailSource {
         else await readMbox(file, accept);
       }
     }
-    return { messages, failures, duplicates, snapshot: { accountId: this.account, rootKeys, files } };
+    return { messages, failures, duplicates, snapshot: { accountId: this.account, rootKeys, files, unlisted } };
   }
 
   async list(): Promise<MailMessage[]> {
@@ -142,30 +161,54 @@ async function resolveRoot(input: string): Promise<{ path: string; name: string;
   }
 }
 
-async function listMailFiles(root: { path: string; name: string; isFile: boolean }): Promise<MailFile[]> {
-  const paths = root.isFile ? [root.path] : await walk(root.path);
+interface ListingFailure {
+  relPath: string;
+  label: string;
+  error: string;
+}
+
+/** Lists mail files under a root. A directory or file that cannot be listed or stat'ed is reported, never fatal. */
+async function listMailFiles(root: { path: string; name: string; isFile: boolean }): Promise<{ files: MailFile[]; failures: ListingFailure[] }> {
+  const failures: ListingFailure[] = [];
+  const relOf = (path: string): string => root.isFile ? basename(path) : relative(root.path, path).split(sep).join("/");
+  const labelOf = (relPath: string): string => root.isFile ? relPath : relPath ? `${root.name}/${relPath}` : root.name;
+  const fail = (path: string, what: string, error: unknown): void => {
+    const relPath = relOf(path);
+    failures.push({ relPath, label: labelOf(relPath), error: `${what} cannot be read (${errorCode(error)})` });
+  };
+  const paths = root.isFile ? [root.path] : await walk(root.path, (path, error) => fail(path, "directory", error));
   const files: MailFile[] = [];
   for (const path of paths) {
-    const extension = extname(path).toLowerCase();
-    if (!Object.hasOwn(MAIL_KIND_BY_EXTENSION, extension)) continue;
-    const kind = MAIL_KIND_BY_EXTENSION[extension];
-    const relPath = root.isFile ? basename(path) : relative(root.path, path).split(sep).join("/");
-    const info = await stat(path);
-    files.push({ path, relPath, label: root.isFile ? relPath : `${root.name}/${relPath}`, kind, size: info.size, mtimeMs: info.mtimeMs });
+    const kind = mailKind(path);
+    if (!kind) continue;
+    let info;
+    try {
+      info = await stat(path);
+    } catch (error) {
+      fail(path, "file", error);
+      continue;
+    }
+    const relPath = relOf(path);
+    files.push({ path, relPath, label: labelOf(relPath), kind, size: info.size, mtimeMs: info.mtimeMs });
   }
-  return files;
+  return { files, failures };
 }
 
 /** Recursively lists regular files (following file symlinks, never directory symlinks), sorted for deterministic duplicate resolution. */
-async function walk(directory: string): Promise<string[]> {
+async function walk(directory: string, onError: (path: string, error: unknown) => void): Promise<string[]> {
+  let entries;
+  try {
+    entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+  } catch (error) {
+    onError(directory, error);
+    return [];
+  }
   const output: string[] = [];
-  const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) output.push(...await walk(path));
+    if (entry.isDirectory()) output.push(...await walk(path, onError));
     else if (entry.isFile()) output.push(path);
-    else if (entry.isSymbolicLink() && Object.hasOwn(MAIL_KIND_BY_EXTENSION, extname(path).toLowerCase())
-      && (await stat(path).catch(() => undefined))?.isFile()) output.push(path);
+    else if (entry.isSymbolicLink() && mailKind(path) && (await stat(path).catch(() => undefined))?.isFile()) output.push(path);
   }
   return output;
 }
@@ -214,6 +257,8 @@ async function readMbox(file: MailFile, accept: (entry: ReadEntry) => void): Pro
   };
 
   const onLine = async (line: Buffer): Promise<void> => {
+    // An editor-added UTF-8 BOM before the first separator is not content.
+    if (ordinal === 0 && !current && line.subarray(0, 3).equals(UTF8_BOM)) line = line.subarray(3);
     const isSeparator = previousBlank && line.subarray(0, 5).equals(FROM_PREFIX);
     previousBlank = line.length === 1 ? line[0] === LF : line.length === 2 && line[0] === CR && line[1] === LF;
     if (isSeparator) {
@@ -265,7 +310,9 @@ async function readMbox(file: MailFile, accept: (entry: ReadEntry) => void): Pro
     return;
   }
   if (notMbox) {
-    accept({ label: file.label, error: "not an mbox file: content before the first From_ separator" });
+    // Unreadable, not complete: an indexed mbox whose head gained stray bytes
+    // must keep its messages instead of releasing all of them.
+    accept({ label: file.label, error: "not an mbox file: content before the first From_ separator", unreadable: true });
     return;
   }
   await finish();
@@ -279,7 +326,9 @@ async function parseEntry(label: string, raw: Buffer, fallbackDate?: string): Pr
     return { label, error: `message cannot be parsed: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (!parsed.headers || parsed.headers.size === 0) return { label, error: "message has no parseable headers" };
-  const messageId = parsed.messageId?.trim() || undefined;
+  const header = parsed.messageId?.trim();
+  // `Message-ID: <>` is not an identity; distinct messages carrying it must not collapse into one.
+  const messageId = header && header !== "<>" ? header : undefined;
   return {
     label,
     message: {
@@ -353,3 +402,4 @@ const GT = 0x3e;
 const FROM_PREFIX = Buffer.from("From ");
 const LF_LF = Buffer.from("\n\n");
 const CRLF_CRLF = Buffer.from("\r\n\r\n");
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
