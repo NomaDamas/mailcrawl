@@ -30,6 +30,8 @@ surface instead of opening the archive database.
 ## Capabilities
 
 - Himalaya-backed IMAP/JMAP/Gmail/Microsoft Graph/Maildir access
+- `.eml` files and `.mbox`/`.mbx` archives on disk (Gmail Takeout, Thunderbird,
+  Apple Mail exports) with no mail account or Himalaya install
 - Stable account/mailbox/message identity and cursor state
 - MIME normalization, HTML-to-text conversion, and quoted-reply handling
 - Email-aware, thread-aware chunking
@@ -64,6 +66,53 @@ default). Messages that stay unreadable are reported in the sync JSON as
 `failures[]` with their `providerKey`, `attempts`, and the redacted himalaya
 error, while the messages that could be read are still synced. The command
 exits non-zero only when nothing could be read.
+
+## Files source: `.eml` and `.mbox` on disk
+
+`--source files` indexes mailbox backups without a mail account or Himalaya:
+
+```bash
+mailcrawl sync --source files --path ~/Mail/backup.mbox --account takeout --json
+mailcrawl sync --source files --path ~/Mail/eml-dir/ --json   # recursive
+```
+
+- `--path` is repeatable and accepts `.eml` files, `.mbox`/`.mbx` archives
+  (mboxo and mboxrd), Apple Mail export bundles (`Inbox.mbox/` holding an
+  `mbox` file), and directories, which are walked recursively. Maildir
+  directories are not read directly; use Himalaya's Maildir backend.
+- `--account` is optional and defaults to the first `--path` name. The mailbox
+  is the mbox file (or bundle) name, or the name of the directory holding an
+  `.eml`; `--mailbox` overrides both.
+- Identity: a message is keyed by its `Message-ID` header, or by the SHA-256 of
+  its raw bytes when the header is missing or empty (`<>`). The same message
+  found in several files of one mailbox is indexed once and listed in
+  `duplicates[]`.
+- Incremental: per-file size and mtime are stored in the archive, so a re-sync
+  with no changes reads nothing. A changed mbox is re-read and reconciled by
+  identity: appending one message adds exactly that message.
+- Deletion: a message is deleted when the last file (or mbox entry) holding
+  it disappears. With an explicit `--account`, a sync is authoritative for
+  that account: paths of the account that are no longer passed (a dropped
+  `--path`, a moved or renamed folder, a changed `--mailbox`) are released,
+  so sync every root of an account together. The release waits for a sync
+  with no failures, so a moved folder with a broken file keeps the old
+  folder's messages until the file is fixed. Without `--account` (the account
+  is derived from the folder name, so `personal/Takeout` and `work/Takeout`
+  share it), other paths are never released. An mbox entry that newly fails
+  to parse never deletes the message it may have been until the entry is
+  fixed or removed; a file or directory that cannot be read, or an mbox with
+  stray bytes before its first `From ` line, keeps its messages and is
+  retried on the next sync.
+- Limits: messages over 50 MiB are skipped, body text is capped at 1,000,000
+  characters, and text attachments over 1 MB keep only their metadata.
+- Failures: unparseable messages are reported in `failures[]` and the rest are
+  indexed; failures of unchanged files are re-reported on later syncs. Files
+  appear in diagnostics as `<path name>/<relative path>[#entry]`, never by
+  absolute path. Gmail `X-Gmail-Labels` become labels, so the default
+  spam/promotions exclusion applies to Takeout archives.
+
+The JSON adds `account`, `files` (mail files found), `filesRead` (files
+re-read because they changed), and `duplicates` to the usual sync counts.
 
 ## Installation
 

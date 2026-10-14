@@ -1,0 +1,43 @@
+From alice@example.com Fri Aug 28 08:00:00 2026
+Message-ID: <thread-1@example.com>
+Date: Fri, 28 Aug 2026 08:00:00 +0000
+From: alice@example.com
+To: bob@example.com
+Subject: Quarterly budget
+X-Gmail-Labels: Inbox,Important,"Work, Finance"
+
+Please review the quarterly budget draft.
+>From the finance team, with thanks.
+>>From line kept with one quote.
+
+From bob@example.com Fri Aug 28 09:00:00 2026
+Message-ID: <thread-2@example.com>
+In-Reply-To: <thread-1@example.com>
+Date: Fri, 28 Aug 2026 09:00:00 +0000
+From: bob@example.com
+To: alice@example.com
+Subject: Re: Quarterly budget
+
+Approved, the budget looks fine.
+
+From notes@example.com Sat Aug 29 07:30:00 2026
+From: notes@example.com
+To: alice@example.com
+Subject: Note without identifier
+
+This message has no Message-ID header and no Date header.
+
+From deals@example.com Sat Aug 29 08:00:00 2026
+Message-ID: <promo-1@example.com>
+Date: Sat, 29 Aug 2026 08:00:00 +0000
+From: deals@example.com
+To: alice@example.com
+Subject: Big sale
+X-Gmail-Labels: Category Promotions,Inbox
+
+Everything is half price this weekend.
+
+From broken@example.com Sat Aug 29 09:00:00 2026
+garbage without any header separator
+more garbage
+

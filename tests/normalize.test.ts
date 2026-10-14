@@ -20,6 +20,19 @@ describe("email normalization and chunks", () => {
     expect(buildChunks(message).map((chunk) => chunk.section)).toEqual(["latest", "quoted"]);
   });
 
+  it.each([
+    ["On Tue, Bob wrote:\n> Old condition.\n", ""],
+    ["> Old condition.\n\n", ""],
+    ["New condition.\r\n\r\nOn Tue, Bob wrote:\r\n> Old condition.\r\n", "New condition."],
+  ])("keeps quoted text out of the latest text when the quote ends in whitespace (%j)", async (text, latest) => {
+    const message = await normalizeMessage({
+      accountId: "a", mailbox: "INBOX", providerKey: "p1", subject: "Re: Contract",
+      from: "a@example.com", to: [], cc: [], date: "2026-08-26T10:00:00Z", text,
+    });
+    expect(message.latestText).toBe(latest);
+    expect(message.quotedText).toContain("> Old condition.");
+  });
+
   it("keeps chunk ids stable for identical normalized content", async () => {
     const input = {
       accountId: "a",

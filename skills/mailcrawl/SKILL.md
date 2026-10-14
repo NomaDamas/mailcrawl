@@ -24,8 +24,8 @@ the `skills/mailcrawl/SKILL.md` directory and activate it only when the user
 requests local email synchronization or search.
 
 Required runtime dependencies are Node.js 24+, the package dependencies, and
-the Himalaya CLI for live synchronization. Fixture synchronization needs no
-mail account.
+the Himalaya CLI for live synchronization. Fixture and files synchronization
+need no mail account and no Himalaya.
 
 Korean lexical search auto-downloads the matching Kiwi model into the local
 cache on first use. `MAILCRAWL_KIWI_MODEL` remains an override for air-gapped
@@ -70,6 +70,24 @@ many simultaneous IMAP connections. `--page-size` only sets the envelope
 window. A read that fails is retried with backoff, and messages that stay
 unreadable appear in the sync JSON `failures[]` while the readable messages
 are still synced; the command exits non-zero only when nothing could be read.
+
+Index a mailbox backup (`.eml` files, `.mbox`/`.mbx` archives, or directories
+of them, such as a Gmail Takeout export) from disk:
+
+```bash
+mailcrawl sync --source files --path ./backup.mbox --account takeout --json
+mailcrawl sync --source files --path ./eml-dir --json
+```
+
+`--path` is repeatable and `--account` defaults to the first path name.
+Re-running is incremental: unchanged files are not read, appended mbox
+messages are added, and messages whose files or mbox entries were removed are
+deleted. With an explicit `--account`, a sync is authoritative for that
+account: pass every `--path` of the account in the same command, because
+paths left out are released once a sync completes without failures. Without
+`--account`, other paths are never released. Unparseable messages and
+unreadable directories appear in `failures[]` by root-relative label; the
+rest are indexed.
 
 Use a fixture for deterministic development:
 

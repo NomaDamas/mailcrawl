@@ -59,6 +59,9 @@ reconciliation:
     sync_cursors
     embedding_queue
     chunks_fts (FTS5)
+    source_files            # files source: size/mtime/failures per file
+    source_file_messages    # files source: which file holds which message
+    source_roots            # files source: --path roots seen per account
   vectors/
     LanceDB tables keyed by chunk_id and embedding_model
   semantic.lance/           # LanceDB vector table (rebuildable)
@@ -91,6 +94,48 @@ contract:
 - JMAP state token
 - Microsoft Graph delta link
 - Maildir file identity and mtime
+
+### Files source
+
+`--source files` reads `.eml` files and `.mbox`/`.mbx` archives from disk
+(`src/files-source.ts`) instead of Himalaya. It follows the same snapshot-diff
+rules with file state in place of provider cursors:
+
+1. Walk every `--path` root and stat each mail file. A directory or file that
+   cannot be listed is reported as a failure and stored files below it are
+   kept. A file whose size and mtime match `source_files` is not read; its
+   stored failures are re-reported.
+2. Parse changed files. Provider identity is the `Message-ID` header, or the
+   SHA-256 of the raw message bytes when it is missing or `<>`. mbox entries
+   are split on `From ` lines that follow a blank line, a leading UTF-8 BOM is
+   ignored, and one level of `>From ` quoting is undone (mboxrd; correct for
+   mboxo too).
+3. Record in `source_file_messages` which file holds which scoped provider
+   key. A completely read file replaces its set, so an mbox entry that
+   disappeared releases its message. An mbox read with a newly failing entry
+   replaces its set only when every message it held was read again;
+   otherwise it only adds, and the entry stays "new" on later reads, because
+   the broken entry may be a previously indexed message. An entry that
+   already failed with the same bytes keeps the read authoritative. An
+   unreadable file (including an mbox with content before its first `From `
+   line) keeps its set and stores no state, so it is retried.
+4. With an explicit `--account`, a files sync is authoritative for that
+   account: roots recorded in `source_roots` for the account but absent from
+   this sync release all their files. The release runs only when the sync
+   has no failure (stored failures of unchanged files included) and no
+   unlisted path, because a broken entry under a moved root may be a message
+   that only the old root still links. A derived account (the first `--path`
+   name) never releases other roots, since unrelated exports can share a
+   folder name.
+5. Delete each released message that no other file still holds; removed
+   files under a scanned root release all their messages.
+
+The root identity includes the account, the `--mailbox` override, and the
+resolved root path, so moving a root or changing `--mailbox` registers a new
+root, and the old one is released by the next clean authoritative sync.
+Stored state recorded under a different exclusion policy is ignored, so
+changing `--include-category` re-reads the files. Diagnostics name files as
+`<root name>/<relative path>[#entry]` and never include absolute paths.
 
 ## Email-aware chunking
 

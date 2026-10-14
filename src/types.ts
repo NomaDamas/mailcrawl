@@ -174,3 +174,68 @@ export interface SourceReadResult {
 export interface ClassificationPolicy {
   excludedCategories?: string[];
 }
+
+/** Stored change-detection state for one file under one files-source root. */
+export interface SourceFileState {
+  size: number;
+  mtimeMs: number;
+  /** Per-message failures from the last read; re-reported while the file is unchanged. */
+  failures: SourceReadFailure[];
+  /** Content keys of the mbox entries that failed to parse in the last read. */
+  failedEntries: string[];
+}
+
+/** Per-file outcome of one files-source scan. */
+export interface SourceFileSnapshot {
+  rootKey: string;
+  relPath: string;
+  size: number;
+  mtimeMs: number;
+  /** False when size and mtime match the stored state; the file was not re-read. */
+  changed: boolean;
+  /**
+   * `complete`: every message was read, or the only failures are mbox entries
+   * that already failed with the same bytes; the file's message set is
+   * replaced. `partial`: an mbox entry newly failed to parse. The archive
+   * replaces the set only when no previously held message is missing from
+   * this read; otherwise the broken entry may be that message, so nothing is
+   * removed until the entry is fixed or deleted. `unreadable`: the file could
+   * not be read or is not an mbox; nothing is removed and no state is stored,
+   * so the next sync retries it.
+   */
+  status: "complete" | "partial" | "unreadable";
+  /** Unscoped provider keys of every message read from this file, duplicates included. */
+  messages: Array<{ mailbox: string; providerKey: string }>;
+  /** Failures from this read, or the stored ones re-reported for an unchanged file. */
+  failures: SourceReadFailure[];
+  /** Content keys of the mbox entries that failed to parse in this read. */
+  failedEntries: string[];
+}
+
+/** A directory or file under a root that could not be listed or stat'ed; stored files at or below it are not treated as removed. */
+export interface UnlistedPath {
+  rootKey: string;
+  /** Root-relative path; `""` is the root itself. */
+  relPath: string;
+}
+
+/**
+ * Complete snapshot of one files sync. When `authoritative` (an explicit
+ * `--account`), stored roots of `accountId` that are not in `rootKeys` (a
+ * dropped `--path`, a moved root, a changed `--mailbox`) are released, but
+ * only after a sync with no unsafe read.
+ */
+export interface FilesSnapshot {
+  accountId: string;
+  /** True only for an explicit account; a derived account never releases other roots. */
+  authoritative: boolean;
+  /** Every stored file under these roots that is absent from `files` was removed from disk. */
+  rootKeys: string[];
+  files: SourceFileSnapshot[];
+  unlisted: UnlistedPath[];
+}
+
+export interface SyncOptions extends ClassificationPolicy {
+  /** Files-source snapshot: reconciles per-file state and deletes messages whose files or mbox entries disappeared. */
+  files?: FilesSnapshot;
+}
