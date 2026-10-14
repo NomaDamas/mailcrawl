@@ -143,7 +143,7 @@ describe("issue 41: files source", () => {
     expect(archive.getMessage(reply)).toBeDefined();
 
     // Removing the broken entry for good releases the message.
-    await writeFile(mbox, broken.replace(/From bob@example\.com[\s\S]*?\n\n(?=From )/, "") + APPENDED);
+    await writeFile(mbox, broken.replace(/From bob@example\.com[\s\S]*?\r?\n\r?\n(?=From )/, "") + APPENDED);
     expect((await syncFiles(archive, [root])).report.deleted).toBe(1);
     expect(archive.getMessage(reply)).toBeUndefined();
     archive.close();
