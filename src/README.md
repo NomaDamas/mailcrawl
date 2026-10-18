@@ -29,7 +29,8 @@ Semantic indexing uses the in-process native embedder —
 on Apple Silicon, CPU fallback) — and stores vectors in a LanceDB table at
 `<data-dir>/semantic.lance`. The model is downloaded to the local cache on
 first use. `EmbeddingGemma` remains available as the `legacy-onnx` opt-in
-profile, and `loopback-http` stays an explicit override (#31). The embedder
+profile, and `loopback-http` stays an explicit override (#31); `tei` and
+`openai` (#43) talk to standard TEI / OpenAI-compatible servers. The embedder
 identity persisted at `<data-dir>/semantic.identity.json` governs reuse: a
 mismatch forces a full rebuild, never silent reuse.
 

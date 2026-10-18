@@ -72,7 +72,7 @@ program
 program
   .command("index")
   .alias("embed")
-  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
   .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -84,6 +84,8 @@ program
   .option("--query-prefix <prefix>")
   .option("--passage-prefix <prefix>")
   .option("--embed-timeout <ms>")
+  .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
+  .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
   .option("--json")
   .action(async (options: EmbedOptions & { rebuild?: boolean }, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
@@ -107,7 +109,7 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--after <date>")
     .option("--before <date>")
     .option("--limit <n>", "result limit", "10")
-    .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+    .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
     .option("--model <model>", "native embedding model id")
     .option("--device <device>", "native device: auto, cpu, webgpu, metal")
     .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -118,6 +120,8 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--query-prefix <prefix>")
     .option("--passage-prefix <prefix>")
     .option("--embed-timeout <ms>")
+    .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
+    .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
     .option("--json")
     .action(async (query: string, options: SearchOptions, command: Command) => {
       const dataDir = command.parent!.opts().dataDir as string;
@@ -147,7 +151,7 @@ program
   .option("--after <date>")
   .option("--before <date>")
   .option("--limit <n>", "result limit", "10")
-  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
   .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -158,6 +162,8 @@ program
   .option("--query-prefix <prefix>")
   .option("--passage-prefix <prefix>")
   .option("--embed-timeout <ms>")
+  .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
+  .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
   .option("--json")
   .action(async (query: string, options: SearchOptions & { mode: string }, command: Command) => {
     const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"), embedderConfig(options));
@@ -262,7 +268,7 @@ program
   .option("--fts")
   .option("--semantic")
   .option("--all")
-  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
+  .option("--provider <provider>", "embedding provider (native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER || "native")
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
   .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -273,6 +279,8 @@ program
   .option("--query-prefix <prefix>")
   .option("--passage-prefix <prefix>")
   .option("--embed-timeout <ms>")
+  .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
+  .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
   .option("--json")
   .action(async (options: EmbedOptions & { fts?: boolean; semantic?: boolean; all?: boolean }, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
@@ -320,6 +328,8 @@ interface EmbedOptions extends JsonOptions {
   queryPrefix?: string;
   passagePrefix?: string;
   embedTimeout?: string;
+  embedAllowRemote?: boolean;
+  embedApiKeyEnv?: string;
 }
 interface SyncOptions extends JsonOptions { source: string; fixture?: string; path: string[]; account?: string; mailbox?: string; backend?: string; pageSize: string; concurrency?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
 interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
@@ -330,16 +340,24 @@ function embedderConfig(options: EmbedOptions): EmbedderConfig {
   if (process.env.MAILCRAWL_EMBEDDER === "mock") return { provider: "mock", batchSize: optionalCount(options.batchSize) };
   // "local" was the pre-#39 default; it names the same in-process path as "native".
   const provider = options.provider === "local" ? "native" : options.provider;
-  if (provider === "loopback-http") {
+  if (provider === "loopback-http" || provider === "tei" || provider === "openai") {
     const url = options.embedUrl ?? process.env.MAILCRAWL_EMBED_URL;
     const model = options.embedModel ?? process.env.MAILCRAWL_EMBED_MODEL;
     const dimension = Number(options.embedDim ?? process.env.MAILCRAWL_EMBED_DIM);
-    if (!url || !model || !Number.isInteger(dimension) || dimension <= 0) throw new Error("--embed-url, --embed-model, and --embed-dim are required for loopback-http");
+    if (!url || !model || !Number.isInteger(dimension) || dimension <= 0) throw new Error(`--embed-url, --embed-model, and --embed-dim are required for ${provider}`);
+    const timeout = options.embedTimeout ?? process.env.MAILCRAWL_EMBED_TIMEOUT;
+    const common = {
+      url, model, dimension,
+      queryPrefix: options.queryPrefix ?? process.env.MAILCRAWL_QUERY_PREFIX,
+      passagePrefix: options.passagePrefix ?? process.env.MAILCRAWL_PASSAGE_PREFIX,
+      timeoutMs: timeout ? Number(timeout) : undefined,
+      batchSize: optionalCount(options.batchSize) ?? envBatchSize(),
+    };
+    if (provider === "loopback-http") return { provider, ...common };
     return {
-      provider: "loopback-http", url, model, dimension,
-      queryPrefix: options.queryPrefix, passagePrefix: options.passagePrefix,
-      timeoutMs: options.embedTimeout ? Number(options.embedTimeout) : undefined,
-      batchSize: optionalCount(options.batchSize),
+      provider, ...common,
+      apiKeyEnv: options.embedApiKeyEnv ?? process.env.MAILCRAWL_EMBED_API_KEY_ENV,
+      allowRemote: options.embedAllowRemote === true || ["1", "true"].includes(process.env.MAILCRAWL_EMBED_ALLOW_REMOTE ?? ""),
     };
   }
   if (provider === "legacy-onnx") return { provider: "legacy-onnx", batchSize: optionalCount(options.batchSize) };

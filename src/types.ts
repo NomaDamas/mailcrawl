@@ -1,6 +1,6 @@
 export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
 
-export type EmbedderProvider = "native" | "legacy-onnx" | "loopback-http" | "mock";
+export type EmbedderProvider = "native" | "legacy-onnx" | "loopback-http" | "tei" | "openai" | "mock";
 
 /** Quantization for the in-process native embedder (ONNX Runtime). */
 export type NativeDtype = "fp32" | "fp16" | "q8" | "int8" | "q4" | "q4f16" | "uint8";
@@ -46,7 +46,28 @@ export interface LoopbackHttpConfig {
   batchSize?: number;
 }
 
-export type EmbedderConfig = NativeEmbedderConfig | LegacyOnnxConfig | LoopbackHttpConfig | MockEmbedderConfig;
+/**
+ * Standard embedding servers (issue #43). `tei` speaks Hugging Face Text
+ * Embeddings Inference (`POST {url}/embed`); `openai` speaks the OpenAI
+ * embeddings API (`POST {url}/v1/embeddings`). Non-loopback URLs need
+ * `allowRemote` and https. The API key is read from the environment variable
+ * named by `apiKeyEnv` and never persisted.
+ */
+export interface ServerEmbedderConfig {
+  provider: "tei" | "openai";
+  url: string;
+  model: string;
+  dimension: number;
+  queryPrefix?: string;
+  passagePrefix?: string;
+  timeoutMs?: number;
+  /** Maximum texts per HTTP request (default 32). */
+  batchSize?: number;
+  apiKeyEnv?: string;
+  allowRemote?: boolean;
+}
+
+export type EmbedderConfig = NativeEmbedderConfig | LegacyOnnxConfig | LoopbackHttpConfig | ServerEmbedderConfig | MockEmbedderConfig;
 
 /**
  * Embedder identity persisted next to the semantic vector table (issue #39:

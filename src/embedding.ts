@@ -5,10 +5,12 @@
  * 1024-d) running on ONNX Runtime's native binding — WebGPU (Metal on Apple
  * Silicon) with CPU fallback, batched, no HTTP sidecar — matching the MinSync
  * native profile. EmbeddingGemma remains as the `legacy-onnx` opt-in profile
- * and `loopback-http` stays as the #31 opt-in override.
+ * and `loopback-http` stays as the #31 opt-in override. `tei` and `openai`
+ * (#43) talk to standard embedding servers such as TEI or any
+ * OpenAI-compatible endpoint.
  */
 import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
-import type { EmbedderConfig, EmbedderIdentity, LegacyOnnxConfig, LoopbackHttpConfig, NativeDtype, NativeEmbedderConfig } from "./types.js";
+import type { EmbedderConfig, EmbedderIdentity, LegacyOnnxConfig, LoopbackHttpConfig, NativeDtype, NativeEmbedderConfig, ServerEmbedderConfig } from "./types.js";
 
 export interface Embedder {
   embedDocuments(texts: string[]): Promise<number[][]>;
@@ -36,6 +38,8 @@ export const DEFAULT_NATIVE_BATCH_SIZE = 4;
 export const RUNTIME_BUILD_NATIVE = "mailcrawl-native";
 export const RUNTIME_BUILD_LEGACY = "mailcrawl-legacy-onnx";
 export const RUNTIME_BUILD_LOOPBACK = "mailcrawl-loopback-http";
+export const RUNTIME_BUILD_TEI = "mailcrawl-tei";
+export const RUNTIME_BUILD_OPENAI = "mailcrawl-openai";
 export const RUNTIME_BUILD_MOCK = "mailcrawl-mock";
 
 const LEGACY_MODEL = "onnx-community/embeddinggemma-300m-ONNX";
@@ -182,11 +186,7 @@ class TestEmbedder implements Embedder {
 
 class LoopbackHttpEmbedder implements Embedder {
   constructor(private readonly config: LoopbackHttpConfig) {
-    const url = new URL(config.url);
-    const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname;
-    if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "::1"].includes(hostname)) {
-      throw new Error("loopback HTTP embedding URL is required");
-    }
+    validateEmbeddingUrl(config.url, false);
     if (!Number.isInteger(config.dimension) || config.dimension <= 0) throw new Error("embedding dimension must be positive");
   }
 
@@ -222,8 +222,113 @@ class LoopbackHttpEmbedder implements Embedder {
   }
 }
 
+/**
+ * Loopback http URLs are always accepted. Anything else needs the explicit
+ * `allowRemote` opt-in and https, because message text leaves the machine.
+ */
+function validateEmbeddingUrl(rawUrl: string, allowRemote: boolean): URL {
+  const url = new URL(rawUrl);
+  const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname;
+  if (url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(hostname)) return url;
+  if (!allowRemote) throw new Error("loopback HTTP embedding URL is required (non-loopback endpoints need --embed-allow-remote and https)");
+  if (url.protocol !== "https:") throw new Error("remote embedding endpoints must use https");
+  return url;
+}
+
+/** Texts per HTTP request when the caller sets no `batchSize`. */
+const SERVER_REQUEST_CAP = 32;
+
+/** TEI (`/embed`) and OpenAI-compatible (`/v1/embeddings`) embedding servers. */
+class ServerEmbedder implements Embedder {
+  private readonly endpoint: string;
+  private readonly apiKey?: string;
+  private readonly cap: number;
+
+  constructor(private readonly config: ServerEmbedderConfig) {
+    const base = validateEmbeddingUrl(config.url, config.allowRemote === true).toString().replace(/\/+$/, "");
+    if (config.provider === "tei") this.endpoint = `${base}/embed`;
+    else this.endpoint = base.endsWith("/v1") ? `${base}/embeddings` : `${base}/v1/embeddings`;
+    if (!Number.isInteger(config.dimension) || config.dimension <= 0) throw new Error("embedding dimension must be positive");
+    this.cap = config.batchSize ?? SERVER_REQUEST_CAP;
+    if (!Number.isInteger(this.cap) || this.cap <= 0) throw new Error("embedding batch size must be a positive integer");
+    if (config.apiKeyEnv) {
+      this.apiKey = process.env[config.apiKeyEnv];
+      if (!this.apiKey) throw new Error(`embedding API key environment variable ${config.apiKeyEnv} is not set`);
+    }
+  }
+
+  async embedDocuments(texts: string[]): Promise<number[][]> {
+    const prefixed = texts.map((text) => (this.config.passagePrefix ?? "") + text);
+    const vectors: number[][] = [];
+    for (let start = 0; start < prefixed.length; start += this.cap) {
+      vectors.push(...await this.request(prefixed.slice(start, start + this.cap)));
+    }
+    return vectors;
+  }
+
+  async embedQuery(query: string): Promise<number[]> {
+    return (await this.request([(this.config.queryPrefix ?? "") + query.trim()]))[0];
+  }
+
+  private async request(texts: string[]): Promise<number[][]> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs ?? 30_000);
+    try {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+      const body = this.config.provider === "tei" ? { inputs: texts } : { model: this.config.model, input: texts };
+      const response = await fetch(this.endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
+      // Status only: response bodies may echo credentials.
+      if (!response.ok) throw new Error(`embedding provider returned HTTP ${response.status}`);
+      const payload: unknown = await response.json();
+      return this.config.provider === "tei"
+        ? teiVectors(payload, texts.length, this.config.dimension)
+        : openaiVectors(payload, texts.length, this.config.dimension);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function isVector(value: unknown, dimension: number): value is number[] {
+  return Array.isArray(value) && value.length === dimension && value.every((entry) => typeof entry === "number");
+}
+
+/** TEI answers `[[...], ...]`, one vector per input. */
+function teiVectors(payload: unknown, count: number, dimension: number): number[][] {
+  if (!Array.isArray(payload) || payload.length !== count) throw new Error("embedding provider returned invalid embeddings");
+  const items: unknown[] = payload;
+  const vectors: number[][] = [];
+  for (const item of items) {
+    if (!isVector(item, dimension)) throw new Error("embedding provider returned invalid vector dimensions");
+    vectors.push(item);
+  }
+  return vectors;
+}
+
+/** OpenAI answers `{ data: [{ index, embedding }] }`; order is restored by `index`. */
+function openaiVectors(payload: unknown, count: number, dimension: number): number[][] {
+  const data = typeof payload === "object" && payload !== null && "data" in payload ? payload.data : undefined;
+  if (!Array.isArray(data) || data.length !== count) throw new Error("embedding provider returned invalid embeddings");
+  const items: unknown[] = data;
+  const ordered: number[][] = new Array(count);
+  for (const item of items) {
+    if (typeof item !== "object" || item === null || !("index" in item) || !("embedding" in item)) {
+      throw new Error("embedding provider returned invalid embeddings");
+    }
+    const { index, embedding } = item;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= count || ordered[index] !== undefined) {
+      throw new Error("embedding provider returned an invalid or duplicate index");
+    }
+    if (!isVector(embedding, dimension)) throw new Error("embedding provider returned invalid vector dimensions");
+    ordered[index] = embedding;
+  }
+  return ordered;
+}
+
 export async function createEmbedder(config?: EmbedderConfig): Promise<Embedder> {
   if (config?.provider === "loopback-http") return new LoopbackHttpEmbedder(config);
+  if (config?.provider === "tei" || config?.provider === "openai") return new ServerEmbedder(config);
   if (config?.provider === "legacy-onnx") return EmbeddingGemma.create();
   if (config?.provider === "native") return NativeEmbedder.create(config);
   if (config?.provider === "mock") return new TestEmbedder();
@@ -245,6 +350,16 @@ export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
         queryPrefix: config.queryPrefix,
         passagePrefix: config.passagePrefix,
         runtimeBuild: RUNTIME_BUILD_LOOPBACK,
+      };
+    case "tei":
+    case "openai":
+      return {
+        provider: config.provider,
+        model: config.model,
+        dimension: config.dimension,
+        queryPrefix: config.queryPrefix,
+        passagePrefix: config.passagePrefix,
+        runtimeBuild: config.provider === "tei" ? RUNTIME_BUILD_TEI : RUNTIME_BUILD_OPENAI,
       };
     case "legacy-onnx":
       return {
