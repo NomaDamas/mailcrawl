@@ -195,7 +195,10 @@ The default embedder is the in-process native profile —
 Node binding, WebGPU (Metal) on Apple Silicon with CPU fallback, batched —
 matching the MinSync local retriever contract: no HTTP sidecar, no gateway
 process. EmbeddingGemma remains as the `legacy-onnx` opt-in profile, and
-`loopback-http` stays an explicit opt-in override for shared gateways.
+`loopback-http` stays an explicit opt-in override for shared gateways. The
+`tei` and `openai` providers (#43) speak the standard TEI `/embed` and
+OpenAI `/v1/embeddings` wire formats; their stored identity is provider +
+model + dimension + prefixes, never the URL.
 
 ### Hybrid
 

@@ -155,15 +155,43 @@ returning garbage scores. `mailcrawl repair --semantic` forces a full rebuild.
   `::1` are accepted. Requires `--embed-url`, `--embed-model`, and
   `--embed-dim`; query/passage prefixes and timeout are optional and are
   included in the provider identity.
+- `tei`: a Hugging Face Text Embeddings Inference server (#43). mailcrawl
+  POSTs `{ "inputs": [...] }` to `{url}/embed` and expects `[[...], ...]`.
+- `openai`: any OpenAI-compatible server (#43). mailcrawl POSTs
+  `{ "model", "input": [...] }` to `{url}/v1/embeddings` (a base URL that
+  already ends in `/v1` also works) and expects
+  `{ "data": [{ "index", "embedding" }] }`; results are ordered by `index`.
+
+`tei` and `openai` take the same options as `loopback-http` (`--embed-url`,
+`--embed-model`, `--embed-dim`, `--query-prefix`, `--passage-prefix`,
+`--embed-timeout`). Every response is checked for vector count, index
+coverage, and dimension. Requests carry at most `--batch-size` texts (default
+32); lower it to the server's client batch limit (TEI's
+`--max-client-batch-size`; larger batches are rejected with an HTTP error). `--embed-api-key-env <NAME>` sends the value of
+that environment variable as `Authorization: Bearer ...`; the key itself is
+never stored or printed. Like `loopback-http`, only `127.0.0.1`, `localhost`,
+and `::1` over http are accepted unless `--embed-allow-remote` is passed,
+which permits any https endpoint (message text then leaves this machine).
+
+Stored identity is provider + model + dimension + prefixes. The URL, port,
+timeout, and API key are not part of it, so moving a server keeps existing
+vectors valid, while switching `tei` to `openai` (or any model, dimension, or
+prefix change) is refused by `search:semantic` and rebuilt by the next
+`mailcrawl index`.
+
+`loopback-http` (custom `{ "texts" }` / `{ "embeddings" }` wire format) is
+unchanged in this release; whether to retire it in favour of `tei` is left
+to the maintainers.
 
 The equivalent environment contract is `MAILCRAWL_EMBEDDER_PROVIDER`
-(`native`, `legacy-onnx`, or `loopback-http`), `MAILCRAWL_NATIVE_MODEL`,
-`MAILCRAWL_NATIVE_DEVICE`, `MAILCRAWL_NATIVE_DTYPE`,
-`MAILCRAWL_EMBED_BATCH_SIZE`, plus the loopback variables
-`MAILCRAWL_EMBED_URL`, `MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`,
-`MAILCRAWL_QUERY_PREFIX`, `MAILCRAWL_PASSAGE_PREFIX`, and
-`MAILCRAWL_EMBED_TIMEOUT`. Any provider identity change triggers a full
-vector rebuild on the next index run.
+(`native`, `legacy-onnx`, `loopback-http`, `tei`, or `openai`),
+`MAILCRAWL_NATIVE_MODEL`, `MAILCRAWL_NATIVE_DEVICE`, `MAILCRAWL_NATIVE_DTYPE`,
+`MAILCRAWL_EMBED_BATCH_SIZE`, plus the server variables `MAILCRAWL_EMBED_URL`,
+`MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`, `MAILCRAWL_QUERY_PREFIX`,
+`MAILCRAWL_PASSAGE_PREFIX`, `MAILCRAWL_EMBED_TIMEOUT`,
+`MAILCRAWL_EMBED_API_KEY_ENV` (the name of the variable holding the key), and
+`MAILCRAWL_EMBED_ALLOW_REMOTE` (`1` or `true`). Any provider identity change
+triggers a full vector rebuild on the next index run.
 
 ## Releasing
 
