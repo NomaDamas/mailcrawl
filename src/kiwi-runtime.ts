@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
-export const KIWI_MODEL_VERSION = "0.23.0" as const;
+export const KIWI_MODEL_VERSION = "0.24.1" as const;
 export const KIWI_MODEL_URL = `https://github.com/bab2min/Kiwi/releases/download/v${KIWI_MODEL_VERSION}/kiwi_model_v${KIWI_MODEL_VERSION}_base.tgz`;
 export const KIWI_MODEL_FILES = [
   "cong.mdl",
@@ -31,7 +31,7 @@ export class KiwiWasmUnresolvedError extends Error {
 export class KiwiModelMissingError extends Error {
   readonly name = "KiwiModelMissingError";
   constructor(
-    message = "Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.23.x). Set it or run `mailcrawl doctor --fix` to download it.",
+    message = "Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.24.x). Set it or run `mailcrawl doctor --fix` to download it.",
   ) {
     super(message);
   }
@@ -77,7 +77,7 @@ export async function resolveKiwiModelDir(options: ResolveKiwiModelOptions = {})
   if (override) {
     if (isCompleteModelDir(override)) return override;
     throw new KiwiModelMissingError(
-      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.23.x): ${override} is missing required model files. Set it or run \`mailcrawl doctor --fix\` to download it.`,
+      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.24.x): ${override} is missing required model files. Set it or run \`mailcrawl doctor --fix\` to download it.`,
     );
   }
   const cache = cacheRoot(env);
@@ -190,7 +190,7 @@ async function provisionKiwiModel(cache: string, options: ResolveKiwiModelOption
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new KiwiModelMissingError(
-      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.23.x). Download failed from ${KIWI_MODEL_URL}: ${reason}. Set MAILCRAWL_KIWI_MODEL or run \`mailcrawl doctor --fix\`.`,
+      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.24.x). Download failed from ${KIWI_MODEL_URL}: ${reason}. Set MAILCRAWL_KIWI_MODEL or run \`mailcrawl doctor --fix\`.`,
     );
   }
   const staging = await mkdtemp(join(tmpdir(), "mailcrawl-kiwi-extract-"));
@@ -198,7 +198,7 @@ async function provisionKiwiModel(cache: string, options: ResolveKiwiModelOption
     await extractTarball(archive, staging);
     if (!findModelDir(staging)) {
       throw new KiwiModelMissingError(
-        `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.23.x). Downloaded archive did not contain required files. Set MAILCRAWL_KIWI_MODEL or run \`mailcrawl doctor --fix\`.`,
+        `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.24.x). Downloaded archive did not contain required files. Set MAILCRAWL_KIWI_MODEL or run \`mailcrawl doctor --fix\`.`,
       );
     }
     await mkdir(dirname(cache), { recursive: true });
@@ -209,13 +209,13 @@ async function provisionKiwiModel(cache: string, options: ResolveKiwiModelOption
     if (error instanceof KiwiModelMissingError) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     throw new KiwiModelMissingError(
-      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.23.x). Failed to install model into ${cache}: ${reason}.`,
+      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.24.x). Failed to install model into ${cache}: ${reason}.`,
     );
   }
   const installed = findModelDir(cache);
   if (!installed) {
     throw new KiwiModelMissingError(
-      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.23.x). Failed to install model into ${cache}.`,
+      `Korean analyzer requires MAILCRAWL_KIWI_MODEL (Kiwi model dir, e.g. cong/base from Kiwi v0.24.x). Failed to install model into ${cache}.`,
     );
   }
   return installed;

@@ -62,7 +62,7 @@ describe("issue 35: Korean Kiwi provisioning", () => {
   it("reuses a complete cache without refetching", async () => {
     // Given a cache that already contains the Kiwi model files
     const xdg = await tempDir("mailcrawl-kiwi-cache-");
-    const cached = await plantModel(join(xdg, "mailcrawl", "kiwi-model", "0.23.0", "cong", "base"));
+    const cached = await plantModel(join(xdg, "mailcrawl", "kiwi-model", "0.24.1", "cong", "base"));
     const fetched: string[] = [];
 
     // When resolveKiwiModelDir runs again
@@ -82,7 +82,7 @@ describe("issue 35: Korean Kiwi provisioning", () => {
   it("uses MAILCRAWL_KIWI_MODEL as an override without downloading", async () => {
     // Given both a populated override directory and a populated cache
     const xdg = await tempDir("mailcrawl-kiwi-override-");
-    await plantModel(join(xdg, "mailcrawl", "kiwi-model", "0.23.0", "cong", "base"));
+    await plantModel(join(xdg, "mailcrawl", "kiwi-model", "0.24.1", "cong", "base"));
     const override = await plantModel(join(xdg, "override-model"));
     const fetched: string[] = [];
 
@@ -182,7 +182,7 @@ describe("issue 35: Korean Kiwi provisioning", () => {
   it("reports ready from a complete cache without MAILCRAWL_KIWI_MODEL", async () => {
     // Given a complete cached model and resolvable WASM
     const xdg = await tempDir("mailcrawl-kiwi-inspect-");
-    const modelDir = await plantModel(join(xdg, "mailcrawl", "kiwi-model", "0.23.0", "cong", "base"));
+    const modelDir = await plantModel(join(xdg, "mailcrawl", "kiwi-model", "0.24.1", "cong", "base"));
 
     // When doctor inspects the Korean analyzer
     const inspection = inspectKoreanAnalyzer({ env: { XDG_CACHE_HOME: xdg, HOME: xdg } });
