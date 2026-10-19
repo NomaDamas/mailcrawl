@@ -27,9 +27,9 @@ resolved automatically from the installed package.
 ## 2. Korean Kiwi model
 
 The npm package contains the Kiwi WASM engine. On first Korean indexing or
-search, mailcrawl downloads the matching Kiwi `v0.23.0` base model into the
-local cache (`$XDG_CACHE_HOME/mailcrawl/kiwi-model/0.23.0` or
-`~/.cache/mailcrawl/kiwi-model/0.23.0`) and reuses it afterwards. This mirrors
+search, mailcrawl downloads the matching Kiwi `v0.24.1` base model into the
+local cache (`$XDG_CACHE_HOME/mailcrawl/kiwi-model/0.24.1` or
+`~/.cache/mailcrawl/kiwi-model/0.24.1`) and reuses it afterwards. This mirrors
 how EmbeddingGemma is cached on first `mailcrawl index`.
 
 `MAILCRAWL_KIWI_MODEL` remains an override for air-gapped or pinned setups.

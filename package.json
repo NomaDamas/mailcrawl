@@ -41,7 +41,7 @@
     "@lancedb/lancedb": "^0.39.0",
     "better-sqlite3": "^12.4.1",
     "commander": "^14.0.0",
-    "kiwi-nlp": "^0.23.0",
+    "kiwi-nlp": "^0.24.1",
     "mailparser": "^3.9.0",
     "mime-types": "^3.0.1"
   },

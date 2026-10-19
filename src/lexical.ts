@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { LexicalLanguage } from "./types.js";
 import { resolveKiwiModelDir, resolveKiwiWasmPath } from "./kiwi-runtime.js";
 
-export const LEXICAL_ANALYZER_VERSION = "kiwi-nlp@0.23.x+kagome-ipa-search+gse-search+arabic-light-v1";
+export const LEXICAL_ANALYZER_VERSION = "kiwi-nlp@0.24.x+kagome-ipa-search+gse-search+arabic-light-v1";
 
 export function lexicalFields(): LexicalLanguage[] {
   return ["ko", "ja", "zh", "ar"];

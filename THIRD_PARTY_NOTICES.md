@@ -9,9 +9,14 @@ runtime dependencies; they do not relicense mailcrawl itself.
 
 - Package: https://www.npmjs.com/package/kiwi-nlp
 - Source: https://github.com/bab2min/Kiwi
-- License: LGPL-2.1-or-later
+- npm package (`kiwi-nlp` >= 0.24.1) license: Apache-2.0
+- Kiwi engine and model source: https://github.com/bab2min/Kiwi
 
-The Kiwi package is not modified by mailcrawl.
+mailcrawl pins `kiwi-nlp` to `^0.24.1`, the first line published under
+Apache-2.0. Earlier releases (<= 0.23.x) were LGPL-2.1-or-later and MUST NOT
+be used. The Kiwi base model (`kiwi_model_v0.24.1_base.tgz`) is downloaded at
+runtime and not redistributed in this package. The Kiwi package is not
+modified by mailcrawl.
 
 ## Japanese helper
 
