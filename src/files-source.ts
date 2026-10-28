@@ -131,7 +131,7 @@ export class FilesSource implements MailSource {
     // exports (`personal/Takeout`, `work/Takeout`), so only an explicit
     // --account makes the sync authoritative over the account's other roots.
     const snapshot = { accountId: this.account, authoritative: this.options.account !== undefined, rootKeys, files, unlisted };
-    return { messages, failures, duplicates, snapshot };
+    return { messages, failures, unchanged: 0, duplicates, snapshot };
   }
 
   async list(): Promise<MailMessage[]> {

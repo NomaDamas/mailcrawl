@@ -59,6 +59,7 @@ const slotDir = join(stateDir, "active");
 mkdirSync(slotDir, { recursive: true });
 const slot = join(slotDir, `${process.pid}-${Date.now()}`);
 writeFileSync(slot, "");
+record("started.log", id);
 await sleep(readDelayMs);
 const observed = readdirSync(slotDir).length;
 const attempt = bumpAttempts(id);

@@ -101,6 +101,8 @@ export interface MailMessage {
   text: string;
   html?: string;
   rawMime?: string;
+  /** Provider envelope fingerprint used to avoid downloading unchanged MIME again. */
+  sourceHash?: string;
   attachments?: AttachmentInput[];
   labels?: string[];
   flags?: string[];
@@ -190,6 +192,8 @@ export interface SourceReadFailure {
 export interface SourceReadResult {
   messages: MailMessage[];
   failures: SourceReadFailure[];
+  /** Envelopes skipped because their persisted source fingerprint matched. */
+  unchanged: number;
 }
 
 export interface ClassificationPolicy {
@@ -259,4 +263,6 @@ export interface FilesSnapshot {
 export interface SyncOptions extends ClassificationPolicy {
   /** Files-source snapshot: reconciles per-file state and deletes messages whose files or mbox entries disappeared. */
   files?: FilesSnapshot;
+  /** Shared across checkpoint batches so the final report counts each touched thread once. */
+  touchedThreadIds?: Set<string>;
 }

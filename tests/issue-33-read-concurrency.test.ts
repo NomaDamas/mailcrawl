@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { HimalayaSource, mapWithConcurrency } from "../src/source.js";
+import { Archive } from "../src/archive.js";
 
 const STUB_SOURCE = join("tests", "fixtures", "himalaya-stub.mjs");
 
@@ -218,6 +219,155 @@ describe("issue #33 bounded Himalaya reads", () => {
     ]);
   });
 
+  it("fetches only new or changed envelopes using persisted source hashes", async () => {
+    const archive = new Archive();
+    const readIds: string[] = [];
+    let envelopes = stubEnvelopes(3) as Array<Record<string, unknown>>;
+    const collect = () => new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes }) };
+        const id = args[args.indexOf("read") + 1];
+        readIds.push(id);
+        return { stdout: JSON.stringify({ message: `raw mime ${id}` }) };
+      },
+    }).collect({
+      previous: (providerKey) => archive.messageSourceHash("stub", "INBOX", providerKey),
+    });
+
+    try {
+      const first = await collect();
+      await archive.sync(first.messages);
+      expect(readIds).toEqual(["1", "2", "3"]);
+
+      const second = await collect();
+      expect(second.messages).toEqual([]);
+      expect(second.unchanged).toBe(3);
+      expect(readIds).toEqual(["1", "2", "3"]);
+
+      envelopes = envelopes.map((envelope) => envelope.id === "2" ? { ...envelope, subject: "Changed subject" } : envelope);
+      const third = await collect();
+      expect(third.messages.map((message) => message.providerKey)).toEqual(["2"]);
+      expect(third.unchanged).toBe(2);
+      expect(readIds).toEqual(["1", "2", "3", "2"]);
+    } finally {
+      archive.close();
+    }
+  });
+
+  it("skips unchanged excluded mail and rereads when the exclusion policy changes", async () => {
+    const archive = new Archive();
+    const envelopes = stubEnvelopes(1) as Array<Record<string, unknown>>;
+    envelopes[0].labels = ["CATEGORY_PROMOTIONS"];
+    let reads = 0;
+    const collect = (excludedCategories?: string[]) => new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes }) };
+        reads += 1;
+        return { stdout: JSON.stringify({ message: "raw mime 1" }) };
+      },
+    }).collect({
+      previous: (providerKey) => archive.messageSourceHash("stub", "INBOX", providerKey, excludedCategories),
+    });
+
+    try {
+      const first = await collect();
+      await archive.sync(first.messages);
+      expect(archive.status().messageCount).toBe(0);
+
+      const second = await collect();
+      expect(second.unchanged).toBe(1);
+      expect(reads).toBe(1);
+
+      const changedPolicy = await collect([]);
+      expect(changedPolicy.messages).toHaveLength(1);
+      expect(reads).toBe(2);
+    } finally {
+      archive.close();
+    }
+  });
+
+  it("checkpoints readable messages before the whole page finishes", async () => {
+    const archive = new Archive();
+    const checkpointed: string[] = [];
+    const source = new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      concurrency: 1,
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes: stubEnvelopes(3) }) };
+        const id = args[args.indexOf("read") + 1];
+        return { stdout: JSON.stringify({ message: `raw mime ${id}` }) };
+      },
+    });
+
+    try {
+      const result = await source.collect({
+        checkpoint: async (message) => {
+          checkpointed.push(message.providerKey);
+          await archive.sync([message]);
+        },
+      });
+
+      expect(checkpointed).toEqual(["1", "2", "3"]);
+      expect(archive.status().messageCount).toBe(3);
+      expect(result.messages).toHaveLength(3);
+    } finally {
+      archive.close();
+    }
+  });
+
+  it("resumes after an interrupted checkpoint without reading committed mail again", async () => {
+    const archive = new Archive();
+    const readIds: string[] = [];
+    let interrupted = true;
+    const collect = () => new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      concurrency: 1,
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes: stubEnvelopes(3) }) };
+        const id = args[args.indexOf("read") + 1];
+        readIds.push(id);
+        return { stdout: JSON.stringify({ message: `raw mime ${id}` }) };
+      },
+    }).collect({
+      previous: (providerKey) => archive.messageSourceHash("stub", "INBOX", providerKey),
+      checkpoint: async (message) => {
+        await archive.sync([message]);
+        if (interrupted && message.providerKey === "1") throw new Error("interrupted");
+      },
+    });
+
+    try {
+      await expect(collect()).rejects.toThrow("interrupted");
+      expect(archive.status().messageCount).toBe(1);
+
+      interrupted = false;
+      const resumed = await collect();
+
+      expect(resumed.unchanged).toBe(1);
+      expect(resumed.messages.map((message) => message.providerKey)).toEqual(["2", "3"]);
+      expect(readIds).toEqual(["1", "2", "3"]);
+      expect(archive.status().messageCount).toBe(3);
+    } finally {
+      archive.close();
+    }
+  });
+
+  it("times out each read attempt instead of waiting forever", async () => {
+    const source = new HimalayaSource("stub", "INBOX", undefined, 1000, undefined, {
+      retryAttempts: 1,
+      readTimeoutMs: 10,
+      exec: async (args) => {
+        if (args.includes("envelope")) return { stdout: JSON.stringify({ envelopes: stubEnvelopes(1) }) };
+        return new Promise(() => {});
+      },
+    });
+
+    const result = await source.collect();
+
+    expect(result.messages).toEqual([]);
+    expect(result.failures).toEqual([
+      { providerKey: "1", attempts: 1, error: expect.stringContaining("himalaya message read timed out after 10ms") },
+    ]);
+  });
+
   posixOnly("reads a page with a bounded pool instead of one process per envelope", async () => {
     const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-pool-"));
     const handle = prepareStub(root);
@@ -249,6 +399,18 @@ describe("issue #33 sync CLI contract", () => {
     }
   });
 
+  it("rejects an invalid --read-timeout before reading the mailbox", () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-read-timeout-invalid-"));
+    try {
+      const result = runCli(join(root, "data"), ["sync", "--source", "himalaya", "--account", "stub", "--read-timeout", "0", "--json"], { ...process.env });
+
+      expect(result.status).not.toBe(0);
+      expect(JSON.parse(result.stderr).error).toContain("--read-timeout must be a positive integer");
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
   posixOnly("syncs readable messages, reports failures, and exits zero", () => {
     const root = mkdtempSync(join(tmpdir(), "mailcrawl-issue-33-cli-partial-"));
     const handle = prepareStub(root);
@@ -264,10 +426,33 @@ describe("issue #33 sync CLI contract", () => {
       });
       expect(JSON.parse(runCli(dataDir, ["status", "--json"], { ...process.env }).stdout)).toMatchObject({ archivePresent: true, messageCount: 11 });
 
-      // A second bounded run only re-reads the same page and stays incremental.
+      // A second run retries only the failed message; unchanged mail is not downloaded.
       const rerun = runCli(dataDir, ["sync", "--source", "himalaya", "--account", "stub", "--page-size", "12", "--concurrency", "2", "--json"], stubEnv(handle, variables));
       expect(rerun.status).toBe(0);
       expect(JSON.parse(rerun.stdout)).toMatchObject({ added: 0, unchanged: 11 });
+      expect(attemptsFor(handle.stateDir, "1")).toBe(1);
+      expect(attemptsFor(handle.stateDir, "9")).toBe(6);
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  }, 60_000);
+
+  posixOnly("kills a real himalaya process when a read exceeds its timeout", () => {
+    const root = mkdtempSync(join(tmpdir(), "mailcrawl-read-timeout-"));
+    const handle = prepareStub(root);
+    const dataDir = join(root, "data");
+    try {
+      const started = Date.now();
+      const sync = runCli(dataDir, ["sync", "--source", "himalaya", "--account", "stub", "--page-size", "1", "--read-timeout", "150", "--json"], stubEnv(handle, {
+        MC_STUB_COUNT: "1",
+        MC_STUB_READ_DELAY_MS: "5000",
+      }));
+
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(sync.status).not.toBe(0);
+      expect(JSON.parse(sync.stderr).error).toContain("no messages could be read");
+      expect(lines(join(handle.stateDir, "started.log"))).toEqual(["1", "1", "1"]);
+      expect(attemptsFor(handle.stateDir, "1")).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }

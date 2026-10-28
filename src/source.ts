@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import type { MailMessage, SourceReadFailure, SourceReadResult } from "./types.js";
 import { redactDiagnostic } from "./redact.js";
+import { hash } from "./util.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,8 +16,18 @@ export const DEFAULT_RETRY_ATTEMPTS = 3;
 /** Default backoff before the second read attempt; doubles per round. */
 export const DEFAULT_RETRY_BASE_DELAY_MS = 250;
 
+/** Default deadline for each individual `himalaya message read` attempt. */
+export const DEFAULT_READ_TIMEOUT_MS = 30_000;
+
 /** Executes one himalaya invocation; replaced by tests. */
-export type HimalayaExec = (args: string[], maxBuffer: number) => Promise<{ stdout: string; stderr?: string }>;
+export type HimalayaExec = (args: string[], maxBuffer: number, timeoutMs?: number) => Promise<{ stdout: string; stderr?: string }>;
+
+export interface HimalayaCollectOptions {
+  /** Returns the persisted envelope fingerprint for an unscoped provider key. */
+  previous?: (providerKey: string) => string | undefined;
+  /** Called after each successful read so callers can persist partial progress. */
+  checkpoint?: (message: MailMessage) => Promise<void>;
+}
 
 export interface HimalayaReadOptions {
   /** Simultaneous message reads; defaults to DEFAULT_READ_CONCURRENCY. */
@@ -25,6 +36,8 @@ export interface HimalayaReadOptions {
   retryAttempts?: number;
   /** Backoff before the second attempt, doubling per round; defaults to DEFAULT_RETRY_BASE_DELAY_MS. */
   retryBaseDelayMs?: number;
+  /** Deadline for each read attempt; defaults to DEFAULT_READ_TIMEOUT_MS. */
+  readTimeoutMs?: number;
   exec?: HimalayaExec;
 }
 
@@ -39,7 +52,7 @@ export class FixtureSource implements MailSource {
   constructor(private readonly path: string) {}
 
   async collect(): Promise<SourceReadResult> {
-    return { messages: await this.list(), failures: [] };
+    return { messages: await this.list(), failures: [], unchanged: 0 };
   }
 
   async list(): Promise<MailMessage[]> {
@@ -58,8 +71,8 @@ export class HimalayaSource implements MailSource {
     private readonly readOptions: HimalayaReadOptions = {},
   ) {}
 
-  async collect(): Promise<SourceReadResult> {
-    return this.readPage(await this.envelopes());
+  async collect(options: HimalayaCollectOptions = {}): Promise<SourceReadResult> {
+    return this.readPage(await this.envelopes(), options);
   }
 
   async list(): Promise<MailMessage[]> {
@@ -68,23 +81,32 @@ export class HimalayaSource implements MailSource {
     return messages;
   }
 
-  /** Reads a page through a bounded pool, retrying failed reads in later rounds. */
-  private async readPage(envelopes: HimalayaEnvelope[]): Promise<SourceReadResult> {
+  /** Reads only new or changed envelopes through a bounded pool, retrying failed reads in later rounds. */
+  private async readPage(envelopes: HimalayaEnvelope[], options: HimalayaCollectOptions): Promise<SourceReadResult> {
     const keys = envelopes.map(envelopeKey);
+    const sourceHashes = envelopes.map((envelope) => hash(JSON.stringify(envelope)));
     const rawMime = new Map<number, string>();
     const errors = new Map<number, Error>();
     const attempts = Math.max(1, Math.floor(this.readOptions.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS));
     const baseDelayMs = Math.max(0, this.readOptions.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS);
-    let pending = envelopes.map((_, index) => index);
+    const skipped = new Set(envelopes.map((_, index) => index).filter((index) => options.previous?.(keys[index]) === sourceHashes[index]));
+    let pending = envelopes.map((_, index) => index).filter((index) => !skipped.has(index));
+    const unchanged = skipped.size;
     for (let attempt = 1; attempt <= attempts && pending.length > 0; attempt += 1) {
       if (attempt > 1) await delay(baseDelayMs * 2 ** (attempt - 2));
       const failed: number[] = [];
       await mapWithConcurrency(pending, this.concurrency, async (index) => {
+        let raw: string;
         try {
-          rawMime.set(index, await this.read(keys[index]));
+          raw = await this.read(keys[index]);
         } catch (error) {
           errors.set(index, error instanceof Error ? error : new Error(String(error)));
           failed.push(index);
+          return;
+        }
+        rawMime.set(index, raw);
+        if (options.checkpoint) {
+          await options.checkpoint(envelopeMessage(this.account, this.mailbox, envelopes[index], keys[index], raw, sourceHashes[index]));
         }
       });
       pending = failed;
@@ -94,12 +116,13 @@ export class HimalayaSource implements MailSource {
     envelopes.forEach((envelope, index) => {
       const raw = rawMime.get(index);
       if (raw !== undefined) {
-        messages.push(envelopeMessage(this.account, this.mailbox, envelope, keys[index], raw));
+        messages.push(envelopeMessage(this.account, this.mailbox, envelope, keys[index], raw, sourceHashes[index]));
         return;
       }
+      if (skipped.has(index)) return;
       failures.push({ providerKey: keys[index], attempts, error: (errors.get(index) ?? new Error("message read failed")).message });
     });
-    return { messages, failures };
+    return { messages, failures, unchanged };
   }
 
   private get concurrency(): number {
@@ -123,13 +146,13 @@ export class HimalayaSource implements MailSource {
   private async read(id: string): Promise<string> {
     const args = this.baseArgs();
     args.push("--json", "message", "read", id, "--raw");
-    const { stdout } = await this.run(args, 32 * 1024 * 1024, "message read");
+    const { stdout } = await this.run(args, 32 * 1024 * 1024, "message read", Math.max(1, Math.floor(this.readOptions.readTimeoutMs ?? DEFAULT_READ_TIMEOUT_MS)));
     const payload = JSON.parse(stdout) as { message?: string };
     return payload.message ?? stdout;
   }
 
-  private run(args: string[], maxBuffer: number, operation: string): Promise<{ stdout: string }> {
-    return runHimalaya(args, maxBuffer, operation, this.readOptions.exec);
+  private run(args: string[], maxBuffer: number, operation: string, timeoutMs?: number): Promise<{ stdout: string }> {
+    return runHimalaya(args, maxBuffer, operation, this.readOptions.exec, timeoutMs);
   }
 }
 
@@ -164,7 +187,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function envelopeMessage(account: string, mailbox: string, envelope: HimalayaEnvelope, providerKey: string, rawMime: string): MailMessage {
+function envelopeMessage(account: string, mailbox: string, envelope: HimalayaEnvelope, providerKey: string, rawMime: string, sourceHash: string): MailMessage {
   return {
     accountId: account,
     mailbox,
@@ -181,15 +204,27 @@ function envelopeMessage(account: string, mailbox: string, envelope: HimalayaEnv
     flags: strings(envelope.flags),
     classifications: strings(envelope.classifications),
     rawMime,
+    sourceHash,
   };
 }
 
-async function runHimalaya(args: string[], maxBuffer: number, operation: string, exec?: HimalayaExec): Promise<{ stdout: string }> {
+async function runHimalaya(args: string[], maxBuffer: number, operation: string, exec?: HimalayaExec, timeoutMs?: number): Promise<{ stdout: string }> {
+  let timer: NodeJS.Timeout | undefined;
   try {
-    return await (exec ?? defaultExec)(args, maxBuffer);
+    const execution = (exec ?? defaultExec)(args, maxBuffer, timeoutMs);
+    if (timeoutMs === undefined) return await execution;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`himalaya ${operation} timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+    return await Promise.race([execution, deadline]);
   } catch (error) {
+    if (timeoutMs !== undefined && (error as { killed?: unknown } | null | undefined)?.killed === true) {
+      throw new Error(`himalaya ${operation} timed out after ${timeoutMs}ms`);
+    }
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`himalaya ${operation} failed: ${redactDiagnostic(detail)}${stderrDetail(error)}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -202,7 +237,7 @@ function stderrDetail(error: unknown): string {
   return `: ${String(redactDiagnostic(text.length > 2_000 ? `${text.slice(0, 2_000)} [truncated]` : text))}`;
 }
 
-const defaultExec: HimalayaExec = (args, maxBuffer) => execFileAsync("himalaya", args, { maxBuffer });
+const defaultExec: HimalayaExec = (args, maxBuffer, timeoutMs) => execFileAsync("himalaya", args, { maxBuffer, timeout: timeoutMs, killSignal: "SIGKILL" });
 
 interface HimalayaEnvelope {
   id?: string | number;
