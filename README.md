@@ -52,20 +52,29 @@ before multilingual search; the command re-analyzes existing messages and
 atomically records the new fingerprint. Embedding model changes are independent
 and require `mailcrawl index` to rebuild the vector table.
 
-## Sync read concurrency
+## Incremental sync and read limits
 
-`mailcrawl sync` reads a page of envelopes through a bounded pool of himalaya
-processes — 4 by default, `--concurrency <n>` to change it — instead of
-spawning one process per envelope. Gmail throttles accounts that open too many
-simultaneous IMAP connections, and an unbounded fan-out made one throttled
-read abort the entire sync. `--page-size` still controls only how many
-envelopes the IMAP window returns.
+`mailcrawl sync` compares each envelope's fingerprint with the fingerprint
+stored for its account/mailbox/provider key. Full raw MIME is downloaded only
+for new or changed envelopes; unchanged and excluded messages are counted
+without spawning a message-read process. The first sync after upgrading from a
+version without stored fingerprints performs a one-time full read. Changing
+the category exclusion policy also forces a full read so previously excluded
+mail cannot be skipped incorrectly.
 
-A read that fails is retried with exponential backoff (three attempts by
-default). Messages that stay unreadable are reported in the sync JSON as
-`failures[]` with their `providerKey`, `attempts`, and the redacted himalaya
-error, while the messages that could be read are still synced. The command
-exits non-zero only when nothing could be read.
+Changed messages are downloaded through a bounded pool of himalaya processes —
+4 by default, `--concurrency <n>` to change it. Every 25 readable messages are
+committed as a checkpoint, so an interrupted sync resumes without downloading
+committed mail again. `--page-size` controls only how many envelopes the IMAP
+window returns.
+
+Each read attempt has a 30-second deadline by default; use `--read-timeout
+<ms>` to change it. A failed or timed-out read is retried with exponential
+backoff (three attempts by default). Messages that stay unreadable are reported
+in the sync JSON as `failures[]` with their `providerKey`, `attempts`, and the
+redacted himalaya error, while readable and previously unchanged messages are
+still synced. The command exits non-zero only when nothing could be read and
+no unchanged mail was available.
 
 ## Files source: `.eml` and `.mbox` on disk
 

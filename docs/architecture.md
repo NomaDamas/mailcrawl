@@ -62,6 +62,7 @@ reconciliation:
     source_files            # files source: size/mtime/failures per file
     source_file_messages    # files source: which file holds which message
     source_roots            # files source: --path roots seen per account
+    source_message_states   # Himalaya envelope hash + exclusion policy per provider key
   vectors/
     LanceDB tables keyed by chunk_id and embedding_model
   semantic.lance/           # LanceDB vector table (rebuildable)
@@ -85,6 +86,12 @@ The first version uses a safe snapshot-diff algorithm:
 6. Normalize and chunk changed messages.
 7. Transactionally update SQLite metadata and FTS5.
 8. Enqueue changed chunks for embedding.
+
+The CLI commits every 25 readable messages instead of waiting for the complete
+page. A restart compares envelope fingerprints against those checkpoints and
+skips committed mail. Fingerprints are stored separately from archived
+messages, including excluded mail; their exclusion policy is part of the state,
+so a policy change forces a safe full read.
 
 Later provider-specific cursors can improve scale without changing the public
 contract:
@@ -214,7 +221,7 @@ All commands support `--json` where machine-readable output is useful.
 ```text
 mailcrawl doctor
 mailcrawl status
-mailcrawl sync [--page-size N] [--concurrency N]
+mailcrawl sync [--page-size N] [--concurrency N] [--read-timeout MS]
 mailcrawl embed
 mailcrawl search --mode fts|bm25|keyword|semantic|hybrid [--limit N] [--mailbox NAME] QUERY
 mailcrawl message get MESSAGE_ID
@@ -222,10 +229,11 @@ mailcrawl repair [--fts|--semantic|--all]
 ```
 
 `--page-size` is the IMAP envelope window and `--concurrency` is the number of
-simultaneous message reads (default 4). Reads run through that bounded pool,
-failures are retried with backoff, and the messages that could be read are
-synced even when some reads keep failing, so a throttled provider no longer
-aborts a whole page.
+simultaneous message reads (default 4). `--read-timeout` bounds each read
+attempt (default 30000 ms). Only new or changed envelopes are read; failures
+are retried with backoff. Readable messages are checkpointed in batches of 25,
+so a later run resumes from committed state even when some reads keep failing
+or the process is interrupted.
 
 Example sync response:
 

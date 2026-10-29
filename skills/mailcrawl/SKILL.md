@@ -64,12 +64,14 @@ command, such as a user-level cron or systemd timer. Run `sync` first and
 `index` afterward; inspect JSON exit status before handing results to an
 agent.
 
-Message reads use a bounded pool of himalaya processes (4 by default; change
-it with `--concurrency <n>`) because Gmail throttles accounts that open too
-many simultaneous IMAP connections. `--page-size` only sets the envelope
-window. A read that fails is retried with backoff, and messages that stay
-unreadable appear in the sync JSON `failures[]` while the readable messages
-are still synced; the command exits non-zero only when nothing could be read.
+Envelope fingerprints prevent raw MIME downloads for unchanged mail. Changed
+messages use a bounded pool of himalaya processes (4 by default; change it with
+`--concurrency <n>`) and commit every 25 messages so an interrupted run resumes
+from the checkpoint. `--page-size` only sets the envelope window. Each read
+attempt times out after 30 seconds by default (`--read-timeout <ms>`), then is
+retried with backoff. Messages that stay unreadable appear in the sync JSON
+`failures[]` while readable and unchanged messages are still synced; the
+command exits non-zero only when no readable or unchanged mail is available.
 
 Index a mailbox backup (`.eml` files, `.mbox`/`.mbx` archives, or directories
 of them, such as a Gmail Takeout export) from disk:

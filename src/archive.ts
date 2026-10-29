@@ -79,6 +79,13 @@ export class Archive {
     }]));
   }
 
+  /** Returns the stored Himalaya envelope fingerprint when the exclusion policy also matches. */
+  messageSourceHash(accountId: string, mailbox: string, providerKey: string, excludedCategories: string[] = DEFAULT_EXCLUDED_CATEGORIES): string | undefined {
+    const row = this.db.prepare("SELECT source_hash FROM source_message_states WHERE provider_key = ? AND policy = ?")
+      .get(scopedId(accountId, mailbox, providerKey), policyKey(excludedCategories)) as { source_hash: string } | undefined;
+    return row?.source_hash;
+  }
+
   status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; vectorCount: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
     const count = (table: "messages" | "chunks"): number =>
       Number((this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
@@ -122,6 +129,7 @@ export class Archive {
       if (typeof message.providerKey !== "string" || !message.providerKey.trim()) throw new Error("message provider identity is required");
     }
     const excludedCategories = new Set((options.excludedCategories ?? DEFAULT_EXCLUDED_CATEGORIES).map(normalizeCategory));
+    const policy = policyKey(options.excludedCategories ?? DEFAULT_EXCLUDED_CATEGORIES);
     const normalized = (await Promise.all(messages.map(normalizeMessage))).map((message) => ({
       ...message,
       messageId: scopedId(message.accountId, message.mailbox, message.messageId),
@@ -140,7 +148,7 @@ export class Archive {
     let added = 0;
     let updated = 0;
     let unchanged = 0;
-    const touched = new Set<string>();
+    const touched = options.touchedThreadIds ?? new Set<string>();
     const rebuildLexical = this.lexicalRebuildRequired;
     const required = [...new Set(included.flatMap((message) => languagesForText(`${message.subject} ${message.text}`)))];
     if (required.length) this.lexical = await createLexicalAnalyzers(required);
@@ -158,8 +166,14 @@ export class Archive {
         analyzedChunks.set(chunk.chunkId, tokens);
       }
     }
-    const transaction = this.db.transaction((items: NormalizedMessage[]) => {
-      for (const message of items) {
+    const transaction = this.db.transaction(() => {
+      const rememberSource = this.db.prepare(`INSERT INTO source_message_states(provider_key, source_hash, policy)
+        VALUES (?, ?, ?)
+        ON CONFLICT(provider_key) DO UPDATE SET source_hash=excluded.source_hash, policy=excluded.policy`);
+      for (const message of normalized) {
+        if (message.sourceHash) rememberSource.run(message.providerKey, message.sourceHash, policy);
+      }
+      for (const message of included) {
         const oldHash = previous.get(message.providerKey);
         if (!oldHash) added++;
         else if (oldHash !== message.normalizedHash) updated++;
@@ -169,13 +183,13 @@ export class Archive {
         if (rebuildLexical || oldHash !== message.normalizedHash) this.replaceMessageChunks(message, analyzedChunks);
       }
     });
-    transaction(included);
+    transaction();
     this.db.prepare(`INSERT INTO lexical_index_meta(id, version, rebuilt_at)
       VALUES (1, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(id) DO UPDATE SET version=excluded.version, rebuilt_at=excluded.rebuilt_at`).run(LEXICAL_ANALYZER_VERSION);
     this.lexicalRebuildRequired = false;
     for (const message of excluded) this.removeMessage(message.providerKey);
-    const deleted = options.files ? this.reconcileFiles(options.files, policyKey(options.excludedCategories ?? DEFAULT_EXCLUDED_CATEGORIES)) : 0;
+    const deleted = options.files ? this.reconcileFiles(options.files, policy) : 0;
     const chunks = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks").get() as { count: number }).count);
     const backlog = Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count);
     return {
@@ -773,6 +787,11 @@ function migrate(db: Database.Database): void {
   -- Roots seen per account; a files sync releases the account's roots it no longer scans.
   CREATE TABLE IF NOT EXISTS source_roots (
     root_key TEXT PRIMARY KEY, account_id TEXT NOT NULL
+  );
+  -- Himalaya envelope fingerprints are independent from archived messages so
+  -- excluded mail can be skipped too. Policy changes force a safe full read.
+  CREATE TABLE IF NOT EXISTS source_message_states (
+    provider_key TEXT PRIMARY KEY, source_hash TEXT NOT NULL, policy TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_source_file_messages_provider ON source_file_messages(provider_key);
   CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(

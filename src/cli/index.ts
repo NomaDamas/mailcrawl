@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Archive } from "../archive.js";
 import { FixtureSource, HimalayaSource } from "../source.js";
 import { FilesSource } from "../files-source.js";
-import type { EmbedderConfig, SearchFilters } from "../types.js";
+import type { EmbedderConfig, MailMessage, SearchFilters } from "../types.js";
 import { redactDiagnostic } from "../redact.js";
 import { inspectKoreanAnalyzer, resolveKiwiModelDir } from "../kiwi-runtime.js";
 import {
@@ -18,6 +18,8 @@ const program = new Command();
 program.name("mailcrawl").description("Local privacy-first email indexing CLI");
 program.option("--data-dir <path>", "archive directory", process.env.MAILCRAWL_DATA_DIR || ".mailcrawl");
 
+const SYNC_CHECKPOINT_BATCH_SIZE = 25;
+
 program
   .command("sync")
   .option("--source <source>", "fixture, himalaya, or files", "himalaya")
@@ -28,6 +30,7 @@ program
   .option("--backend <name>")
   .option("--page-size <n>", "envelopes per page", "1000")
   .option("--concurrency <n>", "simultaneous message reads (default 4)")
+  .option("--read-timeout <ms>", "deadline for each message read attempt (default 30000)")
   .option("--himalaya-config <path>")
   .option("--include-category <name>", "include a normally excluded category", collect, [])
   .option("--exclude-category <name>", "exclude a classification category", collect, [])
@@ -56,9 +59,47 @@ program
         output({ ...report, account: source.account, files: snapshot.files.length, filesRead: snapshot.files.filter((file) => file.changed).length, duplicates, failures }, options.json);
         return;
       }
-      const source = options.source === "fixture"
-        ? fixtureSource(options)
-        : himalayaSource(options);
+      if (options.source === "himalaya") {
+        const source = himalayaSource(options);
+        const pending: MailMessage[] = [];
+        let added = 0;
+        let updated = 0;
+        let deleted = 0;
+        let unchangedMessages = 0;
+        const touchedThreadIds = new Set<string>();
+        let excluded = 0;
+        const excludedByReason: Record<string, number> = {};
+        const flush = async (): Promise<void> => {
+          if (pending.length === 0) return;
+          const report = await archive.sync(pending.splice(0), { excludedCategories, touchedThreadIds });
+          added += report.added;
+          updated += report.updated;
+          deleted += report.deleted;
+          unchangedMessages += report.unchanged;
+          excluded += report.excluded;
+          for (const [reason, count] of Object.entries(report.excludedByReason)) {
+            excludedByReason[reason] = (excludedByReason[reason] ?? 0) + count;
+          }
+        };
+        const { messages, failures, unchanged } = await source.collect({
+          previous: (providerKey) => archive.messageSourceHash(options.account!, options.mailbox ?? "INBOX", providerKey, excludedCategories),
+          checkpoint: async (message) => {
+            pending.push(message);
+            if (pending.length >= SYNC_CHECKPOINT_BATCH_SIZE) await flush();
+          },
+        });
+        await flush();
+        if (messages.length === 0 && failures.length > 0 && unchanged === 0) {
+          throw new Error(`source read failed for all ${failures.length} message(s); no messages could be read: ${failures.slice(0, 3).map((failure) => failure.providerKey).join(", ")}`);
+        }
+        const final = await archive.sync([], { excludedCategories, touchedThreadIds });
+        output({
+          ...final, added, updated, deleted, unchanged: unchangedMessages + unchanged,
+          excluded, excludedByReason, failures,
+        }, options.json);
+        return;
+      }
+      const source = fixtureSource(options);
       const { messages, failures } = await source.collect();
       if (messages.length === 0 && failures.length > 0) {
         throw new Error(`source read failed for all ${failures.length} message(s); no messages could be read: ${failures.slice(0, 3).map((failure) => failure.providerKey).join(", ")}`);
@@ -331,7 +372,7 @@ interface EmbedOptions extends JsonOptions {
   embedAllowRemote?: boolean;
   embedApiKeyEnv?: string;
 }
-interface SyncOptions extends JsonOptions { source: string; fixture?: string; path: string[]; account?: string; mailbox?: string; backend?: string; pageSize: string; concurrency?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
+interface SyncOptions extends JsonOptions { source: string; fixture?: string; path: string[]; account?: string; mailbox?: string; backend?: string; pageSize: string; concurrency?: string; readTimeout?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
 interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
 function filters(options: SearchOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
@@ -394,17 +435,16 @@ function fixtureSource(options: SyncOptions): FixtureSource {
 function himalayaSource(options: SyncOptions): HimalayaSource {
   if (!options.account) throw new Error("--account is required for selected source");
   return new HimalayaSource(options.account, options.mailbox, options.backend, Number(options.pageSize), options.himalayaConfig, {
-    concurrency: readConcurrency(options),
+    concurrency: positiveIntegerOption(options.concurrency, "--concurrency"),
+    readTimeoutMs: positiveIntegerOption(options.readTimeout, "--read-timeout"),
   });
 }
 
-function readConcurrency(options: SyncOptions): number | undefined {
-  if (options.concurrency === undefined) return undefined;
-  const concurrency = Number(options.concurrency);
-  if (!Number.isInteger(concurrency) || concurrency < 1) {
-    throw new Error(`--concurrency must be a positive integer: ${options.concurrency}`);
-  }
-  return concurrency;
+function positiveIntegerOption(value: string | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer: ${value}`);
+  return parsed;
 }
 function output(value: unknown, json?: boolean): void {
   if (json) console.log(JSON.stringify(value));
