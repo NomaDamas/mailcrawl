@@ -17,6 +17,18 @@ export interface Embedder {
   embedQuery(query: string): Promise<number[]>;
 }
 
+/**
+ * The embed provider rejected a request (its HTTP status, not a local crash).
+ * Callers can isolate a rejection — one over-context chunk — and keep going;
+ * anything else is a crash and must propagate so a later run resumes.
+ */
+export class EmbedderRequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "EmbedderRequestError";
+  }
+}
+
 /** Registry of native embedding models (MinSync-aligned ids). */
 interface NativeModelProfile {
   /** Hugging Face repo containing the ONNX export. */
@@ -208,7 +220,7 @@ class LoopbackHttpEmbedder implements Embedder {
         body: JSON.stringify({ model: this.config.model, texts }),
         signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`embedding provider returned HTTP ${response.status}`);
+      if (!response.ok) throw new EmbedderRequestError(response.status, `embedding provider returned HTTP ${response.status}`);
       const payload = await response.json() as { embeddings?: unknown };
       if (!Array.isArray(payload.embeddings) || payload.embeddings.length !== texts.length) throw new Error("embedding provider returned invalid embeddings");
       const vectors = payload.embeddings as number[][];
@@ -276,10 +288,11 @@ class ServerEmbedder implements Embedder {
     try {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
-      const body = this.config.provider === "tei" ? { inputs: texts } : { model: this.config.model, input: texts };
+      const truncate = this.config.truncate ? { truncate: true } : {};
+      const body = this.config.provider === "tei" ? { inputs: texts, ...truncate } : { model: this.config.model, input: texts, ...truncate };
       const response = await fetch(this.endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
       // Status only: response bodies may echo credentials.
-      if (!response.ok) throw new Error(`embedding provider returned HTTP ${response.status}`);
+      if (!response.ok) throw new EmbedderRequestError(response.status, `embedding provider returned HTTP ${response.status}`);
       const payload: unknown = await response.json();
       return this.config.provider === "tei"
         ? teiVectors(payload, texts.length, this.config.dimension)

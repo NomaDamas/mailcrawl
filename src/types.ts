@@ -65,6 +65,8 @@ export interface ServerEmbedderConfig {
   batchSize?: number;
   apiKeyEnv?: string;
   allowRemote?: boolean;
+  /** Send `truncate: true` so the server clips over-context inputs instead of rejecting the request. */
+  truncate?: boolean;
 }
 
 export type EmbedderConfig = NativeEmbedderConfig | LegacyOnnxConfig | LoopbackHttpConfig | ServerEmbedderConfig | MockEmbedderConfig;
