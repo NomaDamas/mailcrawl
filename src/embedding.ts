@@ -288,7 +288,8 @@ class ServerEmbedder implements Embedder {
     try {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
-      const body = this.config.provider === "tei" ? { inputs: texts } : { model: this.config.model, input: texts };
+      const truncate = this.config.truncate ? { truncate: true } : {};
+      const body = this.config.provider === "tei" ? { inputs: texts, ...truncate } : { model: this.config.model, input: texts, ...truncate };
       const response = await fetch(this.endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
       // Status only: response bodies may echo credentials.
       if (!response.ok) throw new EmbedderRequestError(response.status, `embedding provider returned HTTP ${response.status}`);

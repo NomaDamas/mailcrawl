@@ -127,6 +127,7 @@ program
   .option("--embed-timeout <ms>")
   .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
   .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
+  .option("--embed-truncate", "ask the embed server to truncate over-context inputs instead of rejecting them (tei, openai)")
   .option("--json")
   .action(async (options: EmbedOptions & { rebuild?: boolean }, command: Command) => {
     const dataDir = command.parent!.opts().dataDir as string;
@@ -163,6 +164,7 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--embed-timeout <ms>")
     .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
     .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
+    .option("--embed-truncate", "ask the embed server to truncate over-context inputs instead of rejecting them (tei, openai)")
     .option("--json")
     .action(async (query: string, options: SearchOptions, command: Command) => {
       const dataDir = command.parent!.opts().dataDir as string;
@@ -205,6 +207,7 @@ program
   .option("--embed-timeout <ms>")
   .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
   .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
+  .option("--embed-truncate", "ask the embed server to truncate over-context inputs instead of rejecting them (tei, openai)")
   .option("--json")
   .action(async (query: string, options: SearchOptions & { mode: string }, command: Command) => {
     const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"), embedderConfig(options));
@@ -370,6 +373,7 @@ interface EmbedOptions extends JsonOptions {
   passagePrefix?: string;
   embedTimeout?: string;
   embedAllowRemote?: boolean;
+  embedTruncate?: boolean;
   embedApiKeyEnv?: string;
 }
 interface SyncOptions extends JsonOptions { source: string; fixture?: string; path: string[]; account?: string; mailbox?: string; backend?: string; pageSize: string; concurrency?: string; readTimeout?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
@@ -399,6 +403,7 @@ function embedderConfig(options: EmbedOptions): EmbedderConfig {
       provider, ...common,
       apiKeyEnv: options.embedApiKeyEnv ?? process.env.MAILCRAWL_EMBED_API_KEY_ENV,
       allowRemote: options.embedAllowRemote === true || ["1", "true"].includes(process.env.MAILCRAWL_EMBED_ALLOW_REMOTE ?? ""),
+      truncate: options.embedTruncate === true || ["1", "true"].includes(process.env.MAILCRAWL_EMBED_TRUNCATE ?? ""),
     };
   }
   if (provider === "legacy-onnx") return { provider: "legacy-onnx", batchSize: optionalCount(options.batchSize) };
