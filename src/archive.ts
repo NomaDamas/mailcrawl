@@ -6,13 +6,20 @@ import type { Chunk, EmbedderConfig, EmbedderIdentity, FilesSnapshot, MailMessag
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { scopedId, snippet } from "./util.js";
-import { createEmbedder, embedderIdentity, embedderIdentityLabel, embeddingBatchSize, legacyEmbedderIdentity, LEGACY_EMBEDDING_MODEL, type Embedder } from "./embedding.js";
+import { createEmbedder, EmbedderRequestError, embedderIdentity, embedderIdentityLabel, embeddingBatchSize, legacyEmbedderIdentity, LEGACY_EMBEDDING_MODEL, type Embedder } from "./embedding.js";
 import { LanceSemanticStore, MemorySemanticStore, sameEmbedder, type SemanticStore } from "./semantic-store.js";
 import { createLexicalAnalyzers, languagesForText, lexicalFields, LEXICAL_ANALYZER_VERSION, tokenizeForLanguage, type LexicalAnalyzers } from "./lexical.js";
+
+/** Rejection messages kept in a SemanticIndexReport (the rows carry the rest). */
+const EMBED_ERROR_SAMPLES = 3;
 
 export interface SemanticIndexReport {
   embedded: number;
   reused: number;
+  /** Chunks the provider rejected this run; re-pended for the next run. */
+  failed: number;
+  /** First few rejection messages (`chunkId: message`), for diagnostics. */
+  errors: string[];
   archiveRevision: string;
   /** True when the vector table was discarded and rebuilt from scratch. */
   rebuilt: boolean;
@@ -25,6 +32,7 @@ export interface SemanticSummary {
   dimension?: number;
   vectorCount: number;
   embeddingBacklog: number;
+  embeddingFailed: number;
   archiveRevision: string;
 }
 
@@ -86,7 +94,7 @@ export class Archive {
     return row?.source_hash;
   }
 
-  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; vectorCount: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
+  status(): { messageCount: number; chunkCount: number; embeddingBacklog: number; embeddingFailed: number; vectorCount: number; archiveRevision: string; fts: { status: "healthy" | "stale"; rows: number } } {
     const count = (table: "messages" | "chunks"): number =>
       Number((this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count);
     const ftsRows = Number((this.db.prepare("SELECT COUNT(*) AS count FROM chunks_fts").get() as { count: number }).count);
@@ -96,6 +104,7 @@ export class Archive {
       messageCount: count("messages"),
       chunkCount,
       embeddingBacklog: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'pending'").get() as { count: number }).count),
+      embeddingFailed: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'failed'").get() as { count: number }).count),
       // Vectors live in the Lance table now; queue-complete rows are committed 1:1 with them.
       vectorCount: Number((this.db.prepare("SELECT COUNT(*) AS count FROM embedding_queue WHERE state = 'complete'").get() as { count: number }).count),
       archiveRevision: this.revision(),
@@ -106,7 +115,7 @@ export class Archive {
   /** Semantic index health from the vector-store identity plus the embedding queue. */
   async semanticSummary(): Promise<SemanticSummary> {
     const stats = this.status();
-    const base = { vectorCount: stats.vectorCount, embeddingBacklog: stats.embeddingBacklog, archiveRevision: stats.archiveRevision };
+    const base = { vectorCount: stats.vectorCount, embeddingBacklog: stats.embeddingBacklog, embeddingFailed: stats.embeddingFailed, archiveRevision: stats.archiveRevision };
     const store = await this.findStore();
     const identity = store?.readIdentity();
     if (!identity) {
@@ -118,7 +127,7 @@ export class Archive {
     const detail = { provider: identity.provider, model: identity.model, dimension: identity.dimension, ...base };
     if (!sameEmbedder(identity, embedderIdentity(this.embedderConfig))) return { status: "rebuild-required", ...detail };
     const stored = store ? await store.countRows() : 0;
-    if (stats.embeddingBacklog > 0) return { status: "interrupted", ...detail, vectorCount: stored };
+    if (stats.embeddingBacklog > 0 || stats.embeddingFailed > 0) return { status: "interrupted", ...detail, vectorCount: stored };
     if (stored !== stats.vectorCount) return { status: "corrupt", ...detail, vectorCount: stored };
     if (identity.indexedRevision && identity.indexedRevision !== stats.archiveRevision) return { status: "stale", ...detail };
     return { status: "healthy", ...detail };
@@ -356,7 +365,10 @@ export class Archive {
       store.writeIdentity(expected);
     }
     const completeQueueRow = this.db.prepare("UPDATE embedding_queue SET state = 'complete' WHERE chunk_id = ?");
+    const failQueueRow = this.db.prepare("UPDATE embedding_queue SET state = 'failed', attempts = attempts + 1 WHERE chunk_id = ?");
     const reconcile = this.db.transaction(() => {
+      // Rows a previous run could not embed are tried again on every run.
+      this.db.prepare("UPDATE embedding_queue SET state = 'pending' WHERE state = 'failed'").run();
       this.db.prepare("DELETE FROM embedding_queue WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)").run();
       this.db.prepare(`INSERT INTO embedding_queue(chunk_id, content_hash, state, attempts)
         SELECT chunk_id, content_hash, 'pending', 0 FROM chunks
@@ -372,6 +384,8 @@ export class Archive {
     const queueQuery = this.db.prepare("SELECT content_hash, state FROM embedding_queue WHERE chunk_id = ?");
     let embedded = 0;
     let reused = 0;
+    let failed = 0;
+    const errors: string[] = [];
     let embedder: Embedder | undefined;
     for (let offset = 0; ; offset += batchSize) {
       const rows = pageQuery.all(batchSize, offset) as ChunkPageRow[];
@@ -392,19 +406,27 @@ export class Archive {
       }
       if (!batch.length) continue;
       embedder ??= await this.getEmbedder();
-      const vectors = await embedder.embedDocuments(batch.map((row) => row.text));
-      if (vectors.length !== batch.length) throw new Error("embedder returned an unexpected embedding count");
-      const docs = batch.map((row, index) => ({
-        chunkId: row.chunk_id,
-        vector: vectors[index],
-        contentHash: row.content_hash,
-        accountId: row.account_id,
-        mailbox: row.mailbox,
-        threadId: row.thread_id,
-        messageId: row.message_id,
-        date: row.date,
-        fromAddress: row.from_address,
-      }));
+      const { vectors, rejections } = await this.embedPageIsolated(embedder, batch);
+      for (const rejection of rejections) {
+        failQueueRow.run(rejection.chunkId);
+        failed++;
+        if (errors.length < EMBED_ERROR_SAMPLES) errors.push(`${rejection.chunkId}: ${rejection.error}`);
+      }
+      const docs = batch.flatMap((row, index) => {
+        const vector = vectors[index];
+        return vector ? [{
+          chunkId: row.chunk_id,
+          vector,
+          contentHash: row.content_hash,
+          accountId: row.account_id,
+          mailbox: row.mailbox,
+          threadId: row.thread_id,
+          messageId: row.message_id,
+          date: row.date,
+          fromAddress: row.from_address,
+        }] : [];
+      });
+      if (!docs.length) continue;
       await store.upsert(docs);
       // Per-batch commit: the Lance upsert lands first, then the queue rows.
       // A crash in between re-embeds at most one batch on the next run.
@@ -418,7 +440,29 @@ export class Archive {
     }
     const identity = store.readIdentity();
     if (identity) store.writeIdentity({ ...identity, indexedRevision: this.revision() });
-    return { embedded, reused, archiveRevision: this.revision(), rebuilt };
+    return { embedded, reused, failed, errors, archiveRevision: this.revision(), rebuilt };
+  }
+
+  /**
+   * Embeds one page of chunks. A provider rejection — one over-context chunk
+   * failing a whole request — is bisected down to the rows that caused it so
+   * the rest of the page still indexes; crashes propagate so a later run
+   * resumes from the last committed batch.
+   */
+  private async embedPageIsolated(embedder: Embedder, batch: ChunkPageRow[]): Promise<{ vectors: (number[] | undefined)[]; rejections: { chunkId: string; error: string }[] }> {
+    try {
+      const vectors = await embedder.embedDocuments(batch.map((row) => row.text));
+      if (vectors.length !== batch.length) throw new Error("embedder returned an unexpected embedding count");
+      return { vectors, rejections: [] };
+    } catch (error) {
+      const rejection = error instanceof EmbedderRequestError && error.status >= 400 && error.status < 500 ? error : undefined;
+      if (!rejection) throw error;
+      if (batch.length === 1) return { vectors: [undefined], rejections: [{ chunkId: batch[0].chunk_id, error: rejection.message }] };
+      const mid = Math.ceil(batch.length / 2);
+      const left = await this.embedPageIsolated(embedder, batch.slice(0, mid));
+      const right = await this.embedPageIsolated(embedder, batch.slice(mid));
+      return { vectors: [...left.vectors, ...right.vectors], rejections: [...left.rejections, ...right.rejections] };
+    }
   }
 
   /** Vector rows left behind by removed messages are swept at index time. */
