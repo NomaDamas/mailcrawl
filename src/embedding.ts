@@ -1,16 +1,22 @@
 /**
  * Embedding providers (issue #39).
  *
- * Default: an in-process native embedder (`native:Qwen/Qwen3-Embedding-0.6B`,
- * 1024-d) running on ONNX Runtime's native binding — WebGPU (Metal on Apple
- * Silicon) with CPU fallback, batched, no HTTP sidecar — matching the MinSync
- * native profile. EmbeddingGemma remains as the `legacy-onnx` opt-in profile
- * and `loopback-http` stays as the #31 opt-in override. `tei` and `openai`
- * (#43) talk to standard embedding servers such as TEI or any
- * OpenAI-compatible endpoint.
+ * Default (`auto`): prefer the central im-not-llm (`inl`) daemon when one is
+ * serving the dense native model, and otherwise fall back to the in-process
+ * native embedder (`native:Qwen/Qwen3-Embedding-0.6B`, 1024-d) running on
+ * ONNX Runtime's native binding — WebGPU (Metal on Apple Silicon) with CPU
+ * fallback, batched. Both produce interchangeable vectors and share one
+ * persisted identity, so merely starting the daemon never forces a rebuild.
+ * `native` forces the in-process path, `inl` requires a running daemon, and
+ * `legacy-onnx` remains the pre-#39 opt-in profile. `loopback-http` stays as
+ * the #31 opt-in override, and `tei`/`openai` (#43) talk to standard embedding
+ * servers such as TEI or any OpenAI-compatible endpoint.
  */
+import { readdirSync, readFileSync, type Dirent } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
-import type { EmbedderConfig, EmbedderIdentity, LegacyOnnxConfig, LoopbackHttpConfig, NativeDtype, NativeEmbedderConfig, ServerEmbedderConfig } from "./types.js";
+import type { EmbedderConfig, EmbedderIdentity, InlEmbedderConfig, LegacyOnnxConfig, LoopbackHttpConfig, NativeDtype, NativeEmbedderConfig, ServerEmbedderConfig } from "./types.js";
 
 export interface Embedder {
   embedDocuments(texts: string[]): Promise<number[][]>;
@@ -36,6 +42,7 @@ const NATIVE_MODELS: Record<string, NativeModelProfile> = {
 export const DEFAULT_NATIVE_MODEL = "Qwen/Qwen3-Embedding-0.6B";
 export const DEFAULT_NATIVE_BATCH_SIZE = 4;
 export const RUNTIME_BUILD_NATIVE = "mailcrawl-native";
+export const RUNTIME_BUILD_INL = "mailcrawl-inl-daemon";
 export const RUNTIME_BUILD_LEGACY = "mailcrawl-legacy-onnx";
 export const RUNTIME_BUILD_LOOPBACK = "mailcrawl-loopback-http";
 export const RUNTIME_BUILD_TEI = "mailcrawl-tei";
@@ -70,6 +77,114 @@ export function defaultNativeConfig(overrides: Partial<Omit<NativeEmbedderConfig
     queryPrefix: overrides.queryPrefix,
     passagePrefix: overrides.passagePrefix,
   };
+}
+
+/** Zero-config default: the native Qwen3 profile, but daemon-first. */
+export function defaultAutoConfig(overrides: Partial<Omit<NativeEmbedderConfig, "provider" | "dimension">> = {}): NativeEmbedderConfig {
+  return { ...defaultNativeConfig(overrides), provider: "auto" };
+}
+
+/** A dense daemon found through the im-not-llm serve root. */
+export interface InlDaemon {
+  host: string;
+  port: number;
+  /** Base URL, e.g. `http://127.0.0.1:59000` (IPv6 hosts are bracketed). */
+  url: string;
+  modelId: string;
+  dimension: number;
+}
+
+/** Timeout for the `GET /health` probe when discovering a daemon. */
+export const INL_HEALTH_TIMEOUT_MS = 2000;
+
+/**
+ * Root of the im-not-llm state/weight cache: `$HOME/.cache/im-not-llm` on
+ * POSIX and `%LOCALAPPDATA%\im-not-llm` on Windows (mirrors inl `cache_root`).
+ */
+export function inlCacheRoot(): string {
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (localAppData) return join(localAppData, "im-not-llm");
+  }
+  return join(homedir(), ".cache", "im-not-llm");
+}
+
+function isLoopbackHost(host: string): boolean {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return bare === "127.0.0.1" || bare === "::1" || bare === "localhost";
+}
+
+function formatHost(host: string): string {
+  const bare = host.replace(/^\[|\]$/g, "");
+  return bare.includes(":") ? `[${bare}]` : bare;
+}
+
+interface InlHealth {
+  status?: unknown;
+  kind?: unknown;
+  model_id?: unknown;
+  dimension?: unknown;
+}
+
+function readTextFile(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function fetchHealth(host: string, port: number, timeoutMs: number): Promise<InlHealth | undefined> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`http://${formatHost(host)}:${port}/health`, { signal: controller.signal });
+    if (!response.ok) return undefined;
+    return await response.json() as InlHealth;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Finds the im-not-llm daemon serving a dense model on loopback, per the shared
+ * discovery contract: read the `<cache-root>/serve/<instance>` state dirs,
+ * keep only loopback hosts, and match `GET /health` on `status: "ok"`, `kind` (a missing
+ * kind means dense), and `model_id` (case-insensitive). Directory names are
+ * instance keys that consumers cannot interpret and are never matched on.
+ * Returns undefined when nothing answers; never starts a daemon.
+ */
+export async function discoverInlDaemon(options: { model?: string; kind?: string; serveRoot?: string; timeoutMs?: number } = {}): Promise<InlDaemon | undefined> {
+  const serveRoot = options.serveRoot ?? join(inlCacheRoot(), "serve");
+  const wantedModel = (options.model ?? DEFAULT_NATIVE_MODEL).toLowerCase();
+  const wantedKind = options.kind ?? "dense";
+  const timeoutMs = options.timeoutMs ?? INL_HEALTH_TIMEOUT_MS;
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(serveRoot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(serveRoot, entry.name);
+    const host = readTextFile(join(dir, "host")) ?? "127.0.0.1";
+    const port = Number(readTextFile(join(dir, "port")));
+    // A directory without a live port (stale lock, in-flight startup) is skipped.
+    if (!Number.isInteger(port) || port <= 0) continue;
+    if (!isLoopbackHost(host)) continue;
+    const health = await fetchHealth(host, port, timeoutMs);
+    if (!health || health.status !== "ok") continue;
+    const kind = typeof health.kind === "string" ? health.kind : "dense";
+    if (kind !== wantedKind) continue;
+    if (typeof health.model_id !== "string" || health.model_id.toLowerCase() !== wantedModel) continue;
+    const dimension = Number(health.dimension);
+    if (!Number.isInteger(dimension) || dimension <= 0) continue;
+    return { host, port, url: `http://${formatHost(host)}:${port}`, modelId: health.model_id, dimension };
+  }
+  return undefined;
 }
 
 /**
@@ -326,14 +441,46 @@ function openaiVectors(payload: unknown, count: number, dimension: number): numb
   return ordered;
 }
 
+const INL_DAEMON_HINT = "start one with `inl serve` (dense Qwen/Qwen3-Embedding-0.6B; weights under ~/.cache/im-not-llm/models)";
+
+/** The daemon is OpenAI-compatible, so mailcrawl reuses the `openai` wire path. */
+function inlServerConfig(source: InlEmbedderConfig, daemon: InlDaemon): ServerEmbedderConfig {
+  return {
+    provider: "openai",
+    url: daemon.url,
+    model: source.model,
+    dimension: daemon.dimension,
+    queryPrefix: source.queryPrefix,
+    passagePrefix: source.passagePrefix,
+    timeoutMs: source.timeoutMs,
+    batchSize: source.batchSize,
+  };
+}
+
+/** `auto`: a running inl daemon when one answers, otherwise the in-process native embedder. */
+async function createAutoEmbedder(config: NativeEmbedderConfig): Promise<Embedder> {
+  const daemon = await discoverInlDaemon({ model: config.model });
+  if (daemon) return new ServerEmbedder(inlServerConfig({ provider: "inl", model: config.model, queryPrefix: config.queryPrefix, passagePrefix: config.passagePrefix, batchSize: config.batchSize }, daemon));
+  return NativeEmbedder.create({ ...config, provider: "native" });
+}
+
+/** `inl`: a running daemon is mandatory; never auto-starts one. */
+async function createInlEmbedder(config: InlEmbedderConfig): Promise<Embedder> {
+  const daemon = await discoverInlDaemon({ model: config.model });
+  if (!daemon) throw new Error(`no running im-not-llm daemon serves model ${config.model}; ${INL_DAEMON_HINT}`);
+  return new ServerEmbedder(inlServerConfig(config, daemon));
+}
+
 export async function createEmbedder(config?: EmbedderConfig): Promise<Embedder> {
   if (config?.provider === "loopback-http") return new LoopbackHttpEmbedder(config);
   if (config?.provider === "tei" || config?.provider === "openai") return new ServerEmbedder(config);
   if (config?.provider === "legacy-onnx") return EmbeddingGemma.create();
   if (config?.provider === "native") return NativeEmbedder.create(config);
+  if (config?.provider === "inl") return createInlEmbedder(config);
+  if (config?.provider === "auto") return createAutoEmbedder(config);
   if (config?.provider === "mock") return new TestEmbedder();
   if (process.env.MAILCRAWL_EMBEDDER === "mock" || process.env.NODE_ENV === "test") return new TestEmbedder();
-  return NativeEmbedder.create(defaultNativeConfig());
+  return createAutoEmbedder(defaultAutoConfig());
 }
 
 /**
@@ -370,7 +517,12 @@ export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
         passagePrefix: LEGACY_DOCUMENT_PREFIX,
         runtimeBuild: RUNTIME_BUILD_LEGACY,
       };
-    case "native": {
+    case "inl":
+    case "native":
+    case "auto": {
+      // inl and auto persist the native identity: the daemon serves the same
+      // Qwen3-Embedding-0.6B and its vectors are interchangeable (cosine >=
+      // 0.9985), so starting the daemon must not force a pointless re-embed.
       const profile = nativeModelProfile(config.model);
       return {
         provider: "native",
@@ -378,7 +530,7 @@ export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
         dimension: profile.dimension,
         queryPrefix: config.queryPrefix,
         passagePrefix: config.passagePrefix,
-        runtimeBuild: RUNTIME_BUILD_NATIVE,
+        runtimeBuild: config.provider === "inl" ? RUNTIME_BUILD_INL : RUNTIME_BUILD_NATIVE,
       };
     }
     case "mock":
@@ -410,13 +562,13 @@ export function embedderIdentityLabel(identity: EmbedderIdentity): string {
   return `${identity.provider}:${model}:${identity.dimension}`;
 }
 
-/** Batch size for the index loop; native defaults to the MinSync-style 4, others to 32. */
+/** Batch size for the index loop; native/auto default to the MinSync-style 4, others to 32. */
 export function embeddingBatchSize(config?: EmbedderConfig): number {
-  if (config?.provider === "native") return config.batchSize ?? DEFAULT_NATIVE_BATCH_SIZE;
+  if (config?.provider === "native" || config?.provider === "auto") return config.batchSize ?? DEFAULT_NATIVE_BATCH_SIZE;
   return config?.batchSize ?? DEFAULT_BATCH_SIZE;
 }
 
-/** Builds the embedder config from the environment (no flags needed for the default native path). */
+/** Builds the embedder config from the environment (no flags needed for the default `auto` path). */
 export function embedderConfigFromEnvironment(): EmbedderConfig | undefined {
   if (process.env.MAILCRAWL_EMBEDDER === "mock") return { provider: "mock" };
   const provider = process.env.MAILCRAWL_EMBEDDER_PROVIDER;
@@ -435,10 +587,35 @@ export function embedderConfigFromEnvironment(): EmbedderConfig | undefined {
   if (provider === "legacy-onnx") {
     return { provider: "legacy-onnx", batchSize: batchFromEnvironment() };
   }
-  if (provider !== undefined && provider !== "native") throw new Error(`unsupported MAILCRAWL_EMBEDDER_PROVIDER: ${provider}`);
+  if (provider === "tei" || provider === "openai") {
+    const url = process.env.MAILCRAWL_EMBED_URL;
+    const model = process.env.MAILCRAWL_EMBED_MODEL;
+    const dimension = Number(process.env.MAILCRAWL_EMBED_DIM);
+    if (!url || !model || !Number.isInteger(dimension) || dimension <= 0) throw new Error(`MAILCRAWL_EMBED_URL, MAILCRAWL_EMBED_MODEL, and MAILCRAWL_EMBED_DIM are required for ${provider}`);
+    return {
+      provider, url, model, dimension,
+      queryPrefix: process.env.MAILCRAWL_QUERY_PREFIX,
+      passagePrefix: process.env.MAILCRAWL_PASSAGE_PREFIX,
+      timeoutMs: process.env.MAILCRAWL_EMBED_TIMEOUT ? Number(process.env.MAILCRAWL_EMBED_TIMEOUT) : undefined,
+      batchSize: batchFromEnvironment(),
+      apiKeyEnv: process.env.MAILCRAWL_EMBED_API_KEY_ENV,
+      allowRemote: ["1", "true"].includes(process.env.MAILCRAWL_EMBED_ALLOW_REMOTE ?? ""),
+    };
+  }
+  if (provider !== undefined && provider !== "native" && provider !== "auto" && provider !== "inl") throw new Error(`unsupported MAILCRAWL_EMBEDDER_PROVIDER: ${provider}`);
   const model = process.env.MAILCRAWL_NATIVE_MODEL ?? DEFAULT_NATIVE_MODEL;
+  if (provider === "inl") {
+    return {
+      provider: "inl",
+      model,
+      batchSize: batchFromEnvironment(),
+      queryPrefix: process.env.MAILCRAWL_QUERY_PREFIX,
+      passagePrefix: process.env.MAILCRAWL_PASSAGE_PREFIX,
+      timeoutMs: process.env.MAILCRAWL_EMBED_TIMEOUT ? Number(process.env.MAILCRAWL_EMBED_TIMEOUT) : undefined,
+    };
+  }
   return {
-    provider: "native",
+    provider: provider === "native" ? "native" : "auto",
     model,
     dimension: nativeModelProfile(model).dimension,
     device: parseNativeDevice(process.env.MAILCRAWL_NATIVE_DEVICE ?? "auto"),

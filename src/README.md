@@ -24,15 +24,21 @@ with a matching Kiwi model directory containing:
 For current Kiwi releases, use the complete model variant directory described
 in `docs/multilingual-installation.md`; do not mix model and WASM versions.
 
-Semantic indexing uses the in-process native embedder —
-`Qwen/Qwen3-Embedding-0.6B` via ONNX Runtime's native binding (WebGPU/Metal
-on Apple Silicon, CPU fallback) — and stores vectors in a LanceDB table at
-`<data-dir>/semantic.lance`. The model is downloaded to the local cache on
-first use. `EmbeddingGemma` remains available as the `legacy-onnx` opt-in
-profile, and `loopback-http` stays an explicit override (#31); `tei` and
-`openai` (#43) talk to standard TEI / OpenAI-compatible servers. The embedder
-identity persisted at `<data-dir>/semantic.identity.json` governs reuse: a
-mismatch forces a full rebuild, never silent reuse.
+Semantic indexing uses the `Qwen/Qwen3-Embedding-0.6B` (1024-d) profile:
+by default (`auto`) it embeds through a running im-not-llm (`inl`) daemon
+discovered over loopback under `$HOME/.cache/im-not-llm/serve`, and otherwise
+falls back to the same model in-process via ONNX Runtime's native binding
+(WebGPU/Metal on Apple Silicon, CPU fallback). Vectors are stored in a
+LanceDB table at `<data-dir>/semantic.lance`; the in-process fallback
+downloads the model to the local cache on first use. `--provider native`
+forces the in-process path, `--provider inl` requires a running daemon, and
+mailcrawl never starts one. `EmbeddingGemma` remains available as the
+`legacy-onnx` opt-in profile, and `loopback-http` stays an explicit override
+(#31); `tei` and `openai` (#43) talk to standard TEI / OpenAI-compatible
+servers. The embedder identity persisted at
+`<data-dir>/semantic.identity.json` governs reuse: a mismatch forces a full
+rebuild, never silent reuse. `auto` and `inl` persist the native identity, so
+starting the daemon does not force a rebuild.
 
 Japanese and Chinese use the real Kagome and GSE analyzers from the discrawl
 multilingual design. Neither analyzer currently has a usable official Node

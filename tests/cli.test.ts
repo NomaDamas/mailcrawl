@@ -112,4 +112,22 @@ describe("CLI contract", () => {
       await rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  it("fails --provider inl with an actionable message when no daemon runs", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mailcrawl-cli-inl-"));
+    const home = await mkdtemp(join(tmpdir(), "mailcrawl-cli-inl-home-"));
+    try {
+      const cli = ["dist/cli/index.js", "--data-dir", dataDir];
+      const mock = { ...process.env, MAILCRAWL_EMBEDDER: "mock" };
+      await run("node", [...cli, "sync", "--source", "fixture", "--fixture", "tests/fixtures/messages.json", "--json"], { env: mock });
+      // Indexed with the mock embedder, then re-indexed with `inl`: the identity
+      // mismatch forces a rebuild, and there is no daemon under this empty HOME.
+      const noDaemon = { ...process.env, HOME: home, MAILCRAWL_EMBEDDER: "" };
+      await expect(run("node", [...cli, "embed", "--provider", "inl", "--json"], { env: noDaemon }))
+        .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("inl serve") });
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });
