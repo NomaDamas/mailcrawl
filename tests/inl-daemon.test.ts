@@ -54,19 +54,26 @@ function tempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-/** Runs `body` with HOME pointed at a throwaway dir, then restores it. */
+/** Runs `body` with the home and Windows app-data variables pointed at a throwaway dir, then restores them. */
 async function withHome<T>(home: string, body: () => Promise<T>): Promise<T> {
-  const previous = process.env.HOME;
+  const keys = ["HOME", "USERPROFILE", "LOCALAPPDATA"] as const;
+  const previous = keys.map((key) => process.env[key]);
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  process.env.LOCALAPPDATA = join(home, "AppData", "Local");
   try {
     return await body();
   } finally {
-    if (previous === undefined) delete process.env.HOME;
-    else process.env.HOME = previous;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
   }
 }
 
-const serveRootIn = (home: string): string => join(home, ".cache", "im-not-llm", "serve");
+/** The serve root under an isolated home, as `inlCacheRoot` resolves it on this platform. */
+const serveRootIn = (home: string): string =>
+  process.platform === "win32" ? join(home, "AppData", "Local", "im-not-llm", "serve") : join(home, ".cache", "im-not-llm", "serve");
 
 describe("inl daemon discovery", () => {
   it("matches a dense daemon with a matching model over loopback, ignoring the instance name", async () => {
