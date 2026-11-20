@@ -36,7 +36,7 @@ surface instead of opening the archive database.
 - MIME normalization, HTML-to-text conversion, and quoted-reply handling
 - Email-aware, thread-aware chunking
 - Incremental archive, FTS5, and embedding updates
-- In-process native embeddings (`Qwen/Qwen3-Embedding-0.6B` via ONNX Runtime, WebGPU/Metal on Apple Silicon with CPU fallback) stored in LanceDB
+- Qwen3 embeddings (`Qwen/Qwen3-Embedding-0.6B`, 1024-d) served by the central im-not-llm daemon when one runs, otherwise in-process via ONNX Runtime (WebGPU/Metal on Apple Silicon with CPU fallback); stored in LanceDB
 - FTS, semantic, and hybrid search modes
 - JSON output, bounded diagnostics, `status`, `doctor`, and `repair`
 - No credential values in logs, diagnostics, or indexed metadata by default
@@ -132,8 +132,10 @@ before using multilingual indexing or search.
 
 ## Semantic index
 
-The default semantic path is fully in-process: no HTTP sidecar, no gateway.
-Vectors live in a LanceDB table at `<data-dir>/semantic.lance` (a typed
+By default mailcrawl reuses the central im-not-llm (`inl`) daemon when one is
+serving `Qwen/Qwen3-Embedding-0.6B`, and otherwise runs the same model
+in-process (no private sidecar, no gateway of its own). Vectors live in a
+LanceDB table at `<data-dir>/semantic.lance` (a typed
 `Float32` vector column, SQL predicate pushdown for account/mailbox and date
 filters) while SQLite stays the source of truth for messages, chunks, and
 FTS. Indexing pages chunks in small batches (`--batch-size`, default 4 for
@@ -151,11 +153,24 @@ returning garbage scores. `mailcrawl repair --semantic` forces a full rebuild.
 
 ### Embedding providers
 
-- `native` (default): in-process `Qwen/Qwen3-Embedding-0.6B` (1024-d) through
-  ONNX Runtime's native binding — WebGPU (Metal on Apple Silicon) with
-  automatic CPU fallback. Configure with `--model`, `--device` (`auto`, `cpu`,
-  `webgpu`, `metal`), `--dtype` (default `q4f16` on WebGPU), and
-  `--batch-size`.
+- `auto` (default): the `Qwen/Qwen3-Embedding-0.6B` (1024-d) profile, served
+  by a running im-not-llm (`inl`) daemon when one answers and otherwise
+  in-process. mailcrawl never starts a daemon. Configure the model with
+  `--model`/`MAILCRAWL_NATIVE_MODEL`; the in-process fallback honors
+  `--device`, `--dtype`, and `--batch-size`.
+- `inl`: the same profile, but a running im-not-llm daemon is required.
+  mailcrawl discovers the daemon through the shared state root
+  (`$HOME/.cache/im-not-llm/serve/<instance>/{host,port}`; `%LOCALAPPDATA%\im-not-llm`
+  on Windows), accepts only loopback hosts, matches `GET /health` on
+  `status: "ok"`, `kind` (`dense` when omitted), and `model_id`, and embeds
+  through `POST {url}/v1/embeddings` with the dimension taken from `/health`.
+  With no daemon it fails with an `inl serve` hint instead of silently
+  falling back.
+- `native`: forces the in-process `Qwen/Qwen3-Embedding-0.6B` (1024-d)
+  embedder through ONNX Runtime's native binding — WebGPU (Metal on Apple
+  Silicon) with automatic CPU fallback. Configure with `--model`, `--device`
+  (`auto`, `cpu`, `webgpu`, `metal`), `--dtype` (default `q4f16` on WebGPU),
+  and `--batch-size`.
 - `legacy-onnx`: the pre-0.2 EmbeddingGemma profile on CPU, kept for archives
   that must keep their old vector space. On the first index run this profile
   imports compatible legacy JSON vectors instead of re-embedding them.
@@ -188,12 +203,20 @@ vectors valid, while switching `tei` to `openai` (or any model, dimension, or
 prefix change) is refused by `search:semantic` and rebuilt by the next
 `mailcrawl index`.
 
+`auto` and `inl` persist the *native* identity for the same model and
+dimension: the daemon serves the same `Qwen/Qwen3-Embedding-0.6B` and its
+vectors are interchangeable with the in-process ones (cosine ≥ 0.9985), so
+starting the daemon (or stopping it again) never forces a pointless full
+re-embed. The daemon's URL, port, and reported dimension are discovered at
+runtime and never stored.
+
 `loopback-http` (custom `{ "texts" }` / `{ "embeddings" }` wire format) is
 unchanged in this release; whether to retire it in favour of `tei` is left
 to the maintainers.
 
 The equivalent environment contract is `MAILCRAWL_EMBEDDER_PROVIDER`
-(`native`, `legacy-onnx`, `loopback-http`, `tei`, or `openai`),
+(`auto`, `native`, `inl`, `legacy-onnx`, `loopback-http`, `tei`, or `openai`;
+unset means `auto`),
 `MAILCRAWL_NATIVE_MODEL`, `MAILCRAWL_NATIVE_DEVICE`, `MAILCRAWL_NATIVE_DTYPE`,
 `MAILCRAWL_EMBED_BATCH_SIZE`, plus the server variables `MAILCRAWL_EMBED_URL`,
 `MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`, `MAILCRAWL_QUERY_PREFIX`,

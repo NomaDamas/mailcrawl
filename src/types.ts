@@ -1,17 +1,19 @@
 export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
 
-export type EmbedderProvider = "native" | "legacy-onnx" | "loopback-http" | "tei" | "openai" | "mock";
+export type EmbedderProvider = "auto" | "native" | "inl" | "legacy-onnx" | "loopback-http" | "tei" | "openai" | "mock";
 
 /** Quantization for the in-process native embedder (ONNX Runtime). */
 export type NativeDtype = "fp32" | "fp16" | "q8" | "int8" | "q4" | "q4f16" | "uint8";
 
 /**
- * In-process native embedder (issue #39): no HTTP sidecar, batched inference,
- * GPU (WebGPU/Metal on Apple Silicon) with CPU fallback. Mirrors the MinSync
- * `native:Qwen/Qwen3-Embedding-0.6B` profile.
+ * Native Qwen3 profile. `provider: "native"` forces the in-process ONNX
+ * runtime; `provider: "auto"` (the zero-config default) first looks for a
+ * running im-not-llm (`inl`) daemon serving the same dense model and only
+ * falls back to the in-process embedder when none answers. The vectors are
+ * interchangeable, so both share one persisted identity.
  */
 export interface NativeEmbedderConfig {
-  provider: "native";
+  provider: "native" | "auto";
   /** Registry id, e.g. `Qwen/Qwen3-Embedding-0.6B`. */
   model: string;
   dimension: number;
@@ -20,6 +22,24 @@ export interface NativeEmbedderConfig {
   dtype: NativeDtype;
   /** Number of texts per inference batch (MinSync uses 4 for native Metal). */
   batchSize: number;
+  queryPrefix?: string;
+  passagePrefix?: string;
+}
+
+/**
+ * The central im-not-llm (`inl`) daemon (issue #39 follow-up). mailcrawl
+ * discovers the loopback daemon that serves the dense native model and embeds
+ * through its OpenAI-compatible `POST {url}/v1/embeddings`. The URL and
+ * dimension are discovered at runtime, so neither is part of the config or the
+ * persisted identity: the vectors match the in-process native profile.
+ */
+export interface InlEmbedderConfig {
+  provider: "inl";
+  /** Native model id the daemon must be serving; defaults to the native default. */
+  model: string;
+  /** Maximum texts per HTTP request (default 32). */
+  batchSize?: number;
+  timeoutMs?: number;
   queryPrefix?: string;
   passagePrefix?: string;
 }
@@ -67,7 +87,7 @@ export interface ServerEmbedderConfig {
   allowRemote?: boolean;
 }
 
-export type EmbedderConfig = NativeEmbedderConfig | LegacyOnnxConfig | LoopbackHttpConfig | ServerEmbedderConfig | MockEmbedderConfig;
+export type EmbedderConfig = NativeEmbedderConfig | InlEmbedderConfig | LegacyOnnxConfig | LoopbackHttpConfig | ServerEmbedderConfig | MockEmbedderConfig;
 
 /**
  * Embedder identity persisted next to the semantic vector table (issue #39:

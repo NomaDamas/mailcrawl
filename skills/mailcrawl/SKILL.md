@@ -131,9 +131,12 @@ local maintenance operation and should be run only when diagnostics indicate
 that the corresponding index is inconsistent; `repair --semantic` rebuilds
 the vector table from scratch, while `mailcrawl embed` resumes from the last
 committed batch. Vectors live in LanceDB at
-`<data-dir>/semantic.lance`, written by the default in-process native
-embedder (`Qwen/Qwen3-Embedding-0.6B`); no embedding HTTP server is required
-or started.
+`<data-dir>/semantic.lance`, written by the default `auto` embedder: the
+`Qwen/Qwen3-Embedding-0.6B` (1024-d) profile, embedded through a running
+im-not-llm (`inl`) daemon when one answers over loopback and otherwise
+in-process via ONNX Runtime. mailcrawl never starts a daemon; `--provider
+inl` requires a running one. Starting or stopping the daemon does not force a
+vector rebuild.
 
 ## JSON contract
 

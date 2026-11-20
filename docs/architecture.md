@@ -197,15 +197,23 @@ Indexing pages chunks in small configurable batches and commits each batch
 instead of restarting from zero. A failed embedding job must not make FTS
 unavailable.
 
-The default embedder is the in-process native profile —
-`native:Qwen/Qwen3-Embedding-0.6B` (1024-d) through ONNX Runtime's native
-Node binding, WebGPU (Metal) on Apple Silicon with CPU fallback, batched —
-matching the MinSync local retriever contract: no HTTP sidecar, no gateway
-process. EmbeddingGemma remains as the `legacy-onnx` opt-in profile, and
-`loopback-http` stays an explicit opt-in override for shared gateways. The
-`tei` and `openai` providers (#43) speak the standard TEI `/embed` and
-OpenAI `/v1/embeddings` wire formats; their stored identity is provider +
-model + dimension + prefixes, never the URL.
+The default (`auto`) embedder is the native Qwen3 profile —
+`native:Qwen/Qwen3-Embedding-0.6B` (1024-d) — served by the central
+im-not-llm (`inl`) daemon when one is running on loopback and otherwise
+through ONNX Runtime's native Node binding in-process, WebGPU (Metal) on
+Apple Silicon with CPU fallback, batched, matching the MinSync local
+retriever contract. Discovery reads the shared state root
+(`<cache-root>/serve/<instance>/{host,port}`), matches `GET /health` on
+`status: "ok"`, `kind` (dense when omitted), and `model_id`, and embeds via
+the daemon's OpenAI-compatible `POST {url}/v1/embeddings`. mailcrawl never
+starts a daemon; `--provider inl` requires one and fails with an `inl serve`
+hint otherwise. `auto` and `inl` persist the native identity because the
+daemon's vectors are interchangeable with the in-process ones, so starting
+the daemon does not force a rebuild. EmbeddingGemma remains as the
+`legacy-onnx` opt-in profile, and `loopback-http` stays an explicit opt-in
+override for shared gateways. The `tei` and `openai` providers (#43) speak
+the standard TEI `/embed` and OpenAI `/v1/embeddings` wire formats; their
+stored identity is provider + model + dimension + prefixes, never the URL.
 
 ### Hybrid
 
@@ -275,6 +283,8 @@ Example search hit:
 - Secrets never enter archive metadata or diagnostics.
 - Diagnostics are bounded and redact common email/path/secret patterns.
 - Local embeddings are the default recommendation.
+- The im-not-llm (`inl`) daemon is discovered over loopback only and is never
+  started by mailcrawl.
 - Remote embedding providers require explicit configuration.
 - The archive is local and must be treated as sensitive data.
 
