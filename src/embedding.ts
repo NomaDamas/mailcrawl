@@ -1,16 +1,12 @@
 /**
  * Embedding providers (issue #39).
  *
- * Default (`auto`): prefer the central im-not-llm (`inl`) daemon when one is
- * serving the dense native model, and otherwise fall back to the in-process
- * native embedder (`native:Qwen/Qwen3-Embedding-0.6B`, 1024-d) running on
- * ONNX Runtime's native binding — WebGPU (Metal on Apple Silicon) with CPU
- * fallback, batched. Both produce interchangeable vectors and share one
- * persisted identity, so merely starting the daemon never forces a rebuild.
- * `native` forces the in-process path, `inl` requires a running daemon, and
- * `legacy-onnx` remains the pre-#39 opt-in profile. `loopback-http` stays as
- * the #31 opt-in override, and `tei`/`openai` (#43) talk to standard embedding
- * servers such as TEI or any OpenAI-compatible endpoint.
+ * Default (`inl`): the central im-not-llm daemon serving the dense Qwen3-Embedding-0.6B (1024-d), found under
+ * `~/.cache/im-not-llm/serve` and reached over its OpenAI route. mailcrawl never starts it: with none running
+ * the command fails and says to run `inl serve`. `native` opts into the in-process ONNX embedder (WebGPU/CPU),
+ * whose vectors are a different space (cosine 0.90 to 0.96 to the daemon's), so it has its own identity and an
+ * index built one way is rebuilt for the other. `legacy-onnx` remains the pre-#39 opt-in profile,
+ * `loopback-http` stays as the #31 override, and `tei`/`openai` (#43) talk to standard embedding servers.
  */
 import { readdirSync, readFileSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
@@ -79,9 +75,9 @@ export function defaultNativeConfig(overrides: Partial<Omit<NativeEmbedderConfig
   };
 }
 
-/** Zero-config default: the native Qwen3 profile, but daemon-first. */
-export function defaultAutoConfig(overrides: Partial<Omit<NativeEmbedderConfig, "provider" | "dimension">> = {}): NativeEmbedderConfig {
-  return { ...defaultNativeConfig(overrides), provider: "auto" };
+/** Zero-config default: the central inl daemon serving the dense model. */
+export function defaultInlConfig(overrides: Partial<Omit<InlEmbedderConfig, "provider">> = {}): InlEmbedderConfig {
+  return { provider: "inl", model: overrides.model ?? DEFAULT_NATIVE_MODEL, ...overrides };
 }
 
 /** A dense daemon found through the im-not-llm serve root. */
@@ -376,9 +372,33 @@ class ServerEmbedder implements Embedder {
     const prefixed = texts.map((text) => (this.config.passagePrefix ?? "") + text);
     const vectors: number[][] = [];
     for (let start = 0; start < prefixed.length; start += this.cap) {
-      vectors.push(...await this.request(prefixed.slice(start, start + this.cap)));
+      vectors.push(...await this.requestFitting(prefixed.slice(start, start + this.cap)));
     }
     return vectors;
+  }
+
+  /**
+   * One vector per text. A server that refuses a request as over its context (HTTP 413) is asked again with
+   * the request halved; a single text it still refuses is cut in two at whitespace, each half is embedded on
+   * its own and the vector is their length-weighted mean, normalized. Chunking keeps texts well inside the
+   * context, so this only runs for text that tokenizes unusually badly (random hangul, digits, emoji).
+   */
+  private async requestFitting(texts: string[]): Promise<number[][]> {
+    try {
+      return await this.request(texts);
+    } catch (error) {
+      if (!(error instanceof EmbeddingRejectedError)) throw error;
+      if (texts.length > 1) {
+        const middle = Math.ceil(texts.length / 2);
+        return [...await this.requestFitting(texts.slice(0, middle)), ...await this.requestFitting(texts.slice(middle))];
+      }
+      const text = texts[0] ?? "";
+      if (text.length < 2) throw error;
+      const cut = splitAtWhitespace(text);
+      const first = await this.requestFitting([text.slice(0, cut)]);
+      const second = await this.requestFitting([text.slice(cut)]);
+      return [meanUnitVector(first[0]!, cut, second[0]!, text.length - cut)];
+    }
   }
 
   async embedQuery(query: string): Promise<number[]> {
@@ -394,7 +414,10 @@ class ServerEmbedder implements Embedder {
       const body = this.config.provider === "tei" ? { inputs: texts } : { model: this.config.model, input: texts };
       const response = await fetch(this.endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
       // Status only: response bodies may echo credentials.
-      if (!response.ok) throw new Error(`embedding provider returned HTTP ${response.status}`);
+      if (!response.ok) {
+        if (response.status === 413) throw new EmbeddingRejectedError(response.status);
+        throw new Error(`embedding provider returned HTTP ${response.status}`);
+      }
       const payload: unknown = await response.json();
       return this.config.provider === "tei"
         ? teiVectors(payload, texts.length, this.config.dimension)
@@ -403,6 +426,32 @@ class ServerEmbedder implements Embedder {
       clearTimeout(timeout);
     }
   }
+}
+
+/** The server refused the input as too long for its context (HTTP 413); the message is the one callers already saw. */
+class EmbeddingRejectedError extends Error {
+  constructor(readonly status: number) {
+    super(`embedding provider returned HTTP ${status}`);
+    this.name = "EmbeddingRejectedError";
+  }
+}
+
+/** Where to cut `text` into two: the whitespace nearest its middle, else exactly the middle. */
+function splitAtWhitespace(text: string): number {
+  const middle = Math.floor(text.length / 2);
+  const after = text.indexOf(" ", middle);
+  const before = text.lastIndexOf(" ", middle);
+  const candidates = [after, before].filter((index) => index > 0 && index < text.length - 1);
+  if (!candidates.length) return middle;
+  const nearest = candidates.reduce((best, index) => (Math.abs(index - middle) < Math.abs(best - middle) ? index : best));
+  return nearest + 1;
+}
+
+/** Length-weighted mean of two vectors, normalized to unit length like every other embedder here. */
+function meanUnitVector(first: number[], firstLength: number, second: number[], secondLength: number): number[] {
+  const mixed = first.map((value, index) => value * firstLength + second[index]! * secondLength);
+  const norm = Math.hypot(...mixed) || 1;
+  return mixed.map((value) => value / norm);
 }
 
 function isVector(value: unknown, dimension: number): value is number[] {
@@ -457,13 +506,6 @@ function inlServerConfig(source: InlEmbedderConfig, daemon: InlDaemon): ServerEm
   };
 }
 
-/** `auto`: a running inl daemon when one answers, otherwise the in-process native embedder. */
-async function createAutoEmbedder(config: NativeEmbedderConfig): Promise<Embedder> {
-  const daemon = await discoverInlDaemon({ model: config.model });
-  if (daemon) return new ServerEmbedder(inlServerConfig({ provider: "inl", model: config.model, queryPrefix: config.queryPrefix, passagePrefix: config.passagePrefix, batchSize: config.batchSize }, daemon));
-  return NativeEmbedder.create({ ...config, provider: "native" });
-}
-
 /** `inl`: a running daemon is mandatory; never auto-starts one. */
 async function createInlEmbedder(config: InlEmbedderConfig): Promise<Embedder> {
   const daemon = await discoverInlDaemon({ model: config.model });
@@ -477,17 +519,48 @@ export async function createEmbedder(config?: EmbedderConfig): Promise<Embedder>
   if (config?.provider === "legacy-onnx") return EmbeddingGemma.create();
   if (config?.provider === "native") return NativeEmbedder.create(config);
   if (config?.provider === "inl") return createInlEmbedder(config);
-  if (config?.provider === "auto") return createAutoEmbedder(config);
   if (config?.provider === "mock") return new TestEmbedder();
   if (process.env.MAILCRAWL_EMBEDDER === "mock" || process.env.NODE_ENV === "test") return new TestEmbedder();
-  return createAutoEmbedder(defaultAutoConfig());
+  return createInlEmbedder(defaultInlConfig());
 }
 
 /**
- * Embedder identity for persistence (issue #39: identity is data). Pure and
- * synchronous: never loads the model.
+ * True when `config` reaches the im-not-llm daemon's vector space: the `inl` provider, or an `openai` endpoint
+ * on this machine that serves the daemon's Qwen model (what AutoRAG injects). The daemon's port changes on every
+ * start and is no part of the space; a remote endpoint or another model never counts.
+ */
+function reachesInlSpace(config: EmbedderConfig | undefined): boolean {
+  if (config?.provider === "inl") return true;
+  if (config?.provider !== "openai" || config.model.toLowerCase() !== DEFAULT_NATIVE_MODEL.toLowerCase()) return false;
+  try {
+    const url = new URL(config.url);
+    const host = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname;
+    return url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(host);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Embedder identity for persistence (issue #39: identity is data). Pure and synchronous: never loads the model.
+ * Identity is the vector space: `inl` and a loopback `openai` endpoint on the daemon's model share one
+ * (the port and the way the daemon is reached are not part of it), the in-process ONNX embedder has its own,
+ * because its vectors differ from the daemon's (cosine 0.90 to 0.96 measured on the same texts).
  */
 export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
+  if (config === undefined && process.env.MAILCRAWL_EMBEDDER !== "mock" && process.env.NODE_ENV !== "test") return inlIdentity(DEFAULT_NATIVE_MODEL, undefined);
+  if (!reachesInlSpace(config)) return embedderIdentityOf(config);
+  // The query prefix only changes how a query is embedded, never a stored vector, so it is not identity.
+  const model = config && "model" in config ? config.model : DEFAULT_NATIVE_MODEL;
+  return inlIdentity(model, config && "passagePrefix" in config ? config.passagePrefix : undefined);
+}
+
+function inlIdentity(model: string, passagePrefix: string | undefined): EmbedderIdentity {
+  const bare = model.replace(/^native:/, "");
+  return { provider: "inl", model: bare, dimension: nativeModelProfile(bare).dimension, passagePrefix, runtimeBuild: RUNTIME_BUILD_INL };
+}
+
+function embedderIdentityOf(config?: EmbedderConfig): EmbedderIdentity {
   switch (config?.provider) {
     case "loopback-http":
       return {
@@ -517,12 +590,7 @@ export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
         passagePrefix: LEGACY_DOCUMENT_PREFIX,
         runtimeBuild: RUNTIME_BUILD_LEGACY,
       };
-    case "inl":
-    case "native":
-    case "auto": {
-      // inl and auto persist the native identity: the daemon serves the same
-      // Qwen3-Embedding-0.6B and its vectors are interchangeable (cosine >=
-      // 0.9985), so starting the daemon must not force a pointless re-embed.
+    case "native": {
       const profile = nativeModelProfile(config.model);
       return {
         provider: "native",
@@ -530,7 +598,7 @@ export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
         dimension: profile.dimension,
         queryPrefix: config.queryPrefix,
         passagePrefix: config.passagePrefix,
-        runtimeBuild: config.provider === "inl" ? RUNTIME_BUILD_INL : RUNTIME_BUILD_NATIVE,
+        runtimeBuild: RUNTIME_BUILD_NATIVE,
       };
     }
     case "mock":
@@ -539,12 +607,7 @@ export function embedderIdentity(config?: EmbedderConfig): EmbedderIdentity {
       if (process.env.MAILCRAWL_EMBEDDER === "mock" || process.env.NODE_ENV === "test") {
         return { provider: "mock", model: "hash-128", dimension: 128, runtimeBuild: RUNTIME_BUILD_MOCK };
       }
-      return {
-        provider: "native",
-        model: `native:${DEFAULT_NATIVE_MODEL}`,
-        dimension: nativeModelProfile(DEFAULT_NATIVE_MODEL).dimension,
-        runtimeBuild: RUNTIME_BUILD_NATIVE,
-      };
+      return inlIdentity(DEFAULT_NATIVE_MODEL, undefined);
   }
 }
 
@@ -562,13 +625,13 @@ export function embedderIdentityLabel(identity: EmbedderIdentity): string {
   return `${identity.provider}:${model}:${identity.dimension}`;
 }
 
-/** Batch size for the index loop; native/auto default to the MinSync-style 4, others to 32. */
+/** Batch size for the index loop; native defaults to the MinSync-style 4, others to 32. */
 export function embeddingBatchSize(config?: EmbedderConfig): number {
-  if (config?.provider === "native" || config?.provider === "auto") return config.batchSize ?? DEFAULT_NATIVE_BATCH_SIZE;
+  if (config?.provider === "native") return config.batchSize ?? DEFAULT_NATIVE_BATCH_SIZE;
   return config?.batchSize ?? DEFAULT_BATCH_SIZE;
 }
 
-/** Builds the embedder config from the environment (no flags needed for the default `auto` path). */
+/** Builds the embedder config from the environment (no flags needed for the default `inl` path). */
 export function embedderConfigFromEnvironment(): EmbedderConfig | undefined {
   if (process.env.MAILCRAWL_EMBEDDER === "mock") return { provider: "mock" };
   const provider = process.env.MAILCRAWL_EMBEDDER_PROVIDER;
@@ -602,7 +665,7 @@ export function embedderConfigFromEnvironment(): EmbedderConfig | undefined {
       allowRemote: ["1", "true"].includes(process.env.MAILCRAWL_EMBED_ALLOW_REMOTE ?? ""),
     };
   }
-  if (provider !== undefined && provider !== "native" && provider !== "auto" && provider !== "inl") throw new Error(`unsupported MAILCRAWL_EMBEDDER_PROVIDER: ${provider}`);
+  if (provider !== undefined && provider !== "native" && provider !== "inl") throw new Error(`unsupported MAILCRAWL_EMBEDDER_PROVIDER: ${provider}`);
   const model = process.env.MAILCRAWL_NATIVE_MODEL ?? DEFAULT_NATIVE_MODEL;
   if (provider === "inl") {
     return {
@@ -614,8 +677,18 @@ export function embedderConfigFromEnvironment(): EmbedderConfig | undefined {
       timeoutMs: process.env.MAILCRAWL_EMBED_TIMEOUT ? Number(process.env.MAILCRAWL_EMBED_TIMEOUT) : undefined,
     };
   }
+  if (provider === undefined) {
+    return {
+      provider: "inl",
+      model,
+      batchSize: batchFromEnvironment(),
+      queryPrefix: process.env.MAILCRAWL_QUERY_PREFIX,
+      passagePrefix: process.env.MAILCRAWL_PASSAGE_PREFIX,
+      timeoutMs: process.env.MAILCRAWL_EMBED_TIMEOUT ? Number(process.env.MAILCRAWL_EMBED_TIMEOUT) : undefined,
+    };
+  }
   return {
-    provider: provider === "native" ? "native" : "auto",
+    provider: "native",
     model,
     dimension: nativeModelProfile(model).dimension,
     device: parseNativeDevice(process.env.MAILCRAWL_NATIVE_DEVICE ?? "auto"),

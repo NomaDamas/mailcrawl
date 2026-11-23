@@ -143,32 +143,44 @@ the native profile, mirroring MinSync) and commits each batch — vector
 upsert plus queue completion — so a crash resumes from the last committed
 batch instead of restarting from zero.
 
-The active embedder identity (provider, model, dimension, prefixes, runtime
-build) is persisted next to the table in
+The active embedder identity (provider, model, dimension, passage prefix,
+runtime build) is persisted next to the table in
 `<data-dir>/semantic.identity.json`. Identity is data: a mismatch on the next
 `mailcrawl index` discards the vector table and re-embeds everything, never
 silently reusing vectors from a different embedding space. Semantic search
 against a mismatched table fails loudly with a rebuild hint instead of
 returning garbage scores. `mailcrawl repair --semantic` forces a full rebuild.
 
+### Chunking
+
+A message body is split into chunks per section (latest text, quoted text,
+attachments). A paragraph that fits in 2000 characters is one chunk. A longer
+paragraph becomes sliding windows of at most 2000 characters that each repeat
+the last 200 characters of the previous window and cut at whitespace where they
+can, so a sentence split at a boundary still appears whole in one window. 2000
+characters is about 1300 tokens of Korean prose (about 1.6 characters per
+token), inside the daemon's 2048-token context.
+
 ### Embedding providers
 
-- `auto` (default): the `Qwen/Qwen3-Embedding-0.6B` (1024-d) profile, served
-  by a running im-not-llm (`inl`) daemon when one answers and otherwise
-  in-process. mailcrawl never starts a daemon. Configure the model with
-  `--model`/`MAILCRAWL_NATIVE_MODEL`; the in-process fallback honors
-  `--device`, `--dtype`, and `--batch-size`.
-- `inl`: the same profile, but a running im-not-llm daemon is required.
+- `inl` (default): the `Qwen/Qwen3-Embedding-0.6B` (1024-d) profile served by
+  the central im-not-llm daemon. mailcrawl never starts it: with no daemon
+  running the command fails and says to run `inl serve` (it stays up until it is
+  stopped; no idle timeout). Configure the model with
+  `--model`/`MAILCRAWL_NATIVE_MODEL`.
   mailcrawl discovers the daemon through the shared state root
   (`$HOME/.cache/im-not-llm/serve/<instance>/{host,port}`; `%LOCALAPPDATA%\im-not-llm`
   on Windows), accepts only loopback hosts, matches `GET /health` on
   `status: "ok"`, `kind` (`dense` when omitted), and `model_id`, and embeds
   through `POST {url}/v1/embeddings` with the dimension taken from `/health`.
-  With no daemon it fails with an `inl serve` hint instead of silently
-  falling back.
-- `native`: forces the in-process `Qwen/Qwen3-Embedding-0.6B` (1024-d)
-  embedder through ONNX Runtime's native binding — WebGPU (Metal on Apple
-  Silicon) with automatic CPU fallback. Configure with `--model`, `--device`
+  Texts the daemon refuses as over its 2048-token context (HTTP 413) are split
+  and embedded in halves (a unit-length weighted mean), so one badly
+  tokenizing chunk cannot stop an index run.
+- `native`: opt-in in-process `Qwen/Qwen3-Embedding-0.6B` (1024-d) embedder
+  through ONNX Runtime's native binding — WebGPU (Metal on Apple Silicon) with
+  automatic CPU fallback. Its q4f16 vectors are not the daemon's (cosine 0.90 to
+  0.96 on the same texts), so it has its own identity: switching between
+  `native` and `inl` rebuilds the index. Configure with `--model`, `--device`
   (`auto`, `cpu`, `webgpu`, `metal`), `--dtype` (default `q4f16` on WebGPU),
   and `--batch-size`.
 - `legacy-onnx`: the pre-0.2 EmbeddingGemma profile on CPU, kept for archives
@@ -197,26 +209,32 @@ never stored or printed. Like `loopback-http`, only `127.0.0.1`, `localhost`,
 and `::1` over http are accepted unless `--embed-allow-remote` is passed,
 which permits any https endpoint (message text then leaves this machine).
 
-Stored identity is provider + model + dimension + prefixes. The URL, port,
-timeout, and API key are not part of it, so moving a server keeps existing
+Stored identity is provider + model + dimension + passage prefix. The query
+prefix is not part of it (it only changes how a query is embedded), and neither
+are the URL, port, timeout, and API key, so moving a server keeps existing
 vectors valid, while switching `tei` to `openai` (or any model, dimension, or
-prefix change) is refused by `search:semantic` and rebuilt by the next
+passage-prefix change) is refused by `search:semantic` and rebuilt by the next
 `mailcrawl index`.
 
-`auto` and `inl` persist the *native* identity for the same model and
-dimension: the daemon serves the same `Qwen/Qwen3-Embedding-0.6B` and its
-vectors are interchangeable with the in-process ones (cosine ≥ 0.9985), so
-starting the daemon (or stopping it again) never forces a pointless full
-re-embed. The daemon's URL, port, and reported dimension are discovered at
-runtime and never stored.
+The identity is the vector space, not the way the daemon is reached: the `inl`
+provider, the default, and an `openai` endpoint on this machine that serves
+`Qwen/Qwen3-Embedding-0.6B` (what AutoRAG injects for a running daemon) all
+store `inl:Qwen/Qwen3-Embedding-0.6B:1024`. mailcrawl run by hand and mailcrawl
+run by AutoRAG therefore share one index, and a daemon restart on a new port
+changes nothing. An `openai` endpoint that is remote, or serves another model,
+keeps its own `openai:` identity.
+
+Upgrading from 0.3.0 or 0.3.1: those versions stored `native:` or `openai:`
+identities and compared the query prefix, so the first `mailcrawl index` after
+upgrading rebuilds the vector table once.
 
 `loopback-http` (custom `{ "texts" }` / `{ "embeddings" }` wire format) is
 unchanged in this release; whether to retire it in favour of `tei` is left
 to the maintainers.
 
 The equivalent environment contract is `MAILCRAWL_EMBEDDER_PROVIDER`
-(`auto`, `native`, `inl`, `legacy-onnx`, `loopback-http`, `tei`, or `openai`;
-unset means `auto`),
+(`inl`, `native`, `legacy-onnx`, `loopback-http`, `tei`, or `openai`;
+unset means `inl`),
 `MAILCRAWL_NATIVE_MODEL`, `MAILCRAWL_NATIVE_DEVICE`, `MAILCRAWL_NATIVE_DTYPE`,
 `MAILCRAWL_EMBED_BATCH_SIZE`, plus the server variables `MAILCRAWL_EMBED_URL`,
 `MAILCRAWL_EMBED_MODEL`, `MAILCRAWL_EMBED_DIM`, `MAILCRAWL_QUERY_PREFIX`,

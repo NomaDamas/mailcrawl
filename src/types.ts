@@ -1,19 +1,16 @@
 export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
 
-export type EmbedderProvider = "auto" | "native" | "inl" | "legacy-onnx" | "loopback-http" | "tei" | "openai" | "mock";
+export type EmbedderProvider = "native" | "inl" | "legacy-onnx" | "loopback-http" | "tei" | "openai" | "mock";
 
 /** Quantization for the in-process native embedder (ONNX Runtime). */
 export type NativeDtype = "fp32" | "fp16" | "q8" | "int8" | "q4" | "q4f16" | "uint8";
 
 /**
- * Native Qwen3 profile. `provider: "native"` forces the in-process ONNX
- * runtime; `provider: "auto"` (the zero-config default) first looks for a
- * running im-not-llm (`inl`) daemon serving the same dense model and only
- * falls back to the in-process embedder when none answers. The vectors are
- * interchangeable, so both share one persisted identity.
+ * In-process Qwen3 profile (ONNX Runtime). Opt-in with `provider: "native"`: its vectors are not the daemon's
+ * (cosine 0.90 to 0.96 on the same texts), so an index built this way is a different space from the default one.
  */
 export interface NativeEmbedderConfig {
-  provider: "native" | "auto";
+  provider: "native";
   /** Registry id, e.g. `Qwen/Qwen3-Embedding-0.6B`. */
   model: string;
   dimension: number;
@@ -27,11 +24,9 @@ export interface NativeEmbedderConfig {
 }
 
 /**
- * The central im-not-llm (`inl`) daemon (issue #39 follow-up). mailcrawl
- * discovers the loopback daemon that serves the dense native model and embeds
- * through its OpenAI-compatible `POST {url}/v1/embeddings`. The URL and
- * dimension are discovered at runtime, so neither is part of the config or the
- * persisted identity: the vectors match the in-process native profile.
+ * The central im-not-llm (`inl`) daemon, mailcrawl's default embedder. mailcrawl discovers the loopback daemon
+ * that serves the dense model and embeds through its OpenAI-compatible `POST {url}/v1/embeddings`. The URL and
+ * dimension are discovered at runtime, so neither is part of the config or the persisted identity.
  */
 export interface InlEmbedderConfig {
   provider: "inl";

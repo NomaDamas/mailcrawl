@@ -186,7 +186,7 @@ truth for messages, chunks, and FTS; the Lance table is a rebuildable semantic
 index. Account, mailbox, thread, sender, and date filters are pushed down as
 Lance SQL predicates; the `to` filter is applied during SQLite hydration.
 
-The embedder identity (provider, model, dimension, prefixes, runtime build)
+The embedder identity (provider, model, dimension, passage prefix, runtime build)
 is persisted next to the table in `<data-dir>/semantic.identity.json`.
 Identity is data: a mismatch discards the vector table and re-embeds
 everything on the next index run, and search against a mismatched table fails
@@ -197,19 +197,21 @@ Indexing pages chunks in small configurable batches and commits each batch
 instead of restarting from zero. A failed embedding job must not make FTS
 unavailable.
 
-The default (`auto`) embedder is the native Qwen3 profile —
-`native:Qwen/Qwen3-Embedding-0.6B` (1024-d) — served by the central
-im-not-llm (`inl`) daemon when one is running on loopback and otherwise
-through ONNX Runtime's native Node binding in-process, WebGPU (Metal) on
-Apple Silicon with CPU fallback, batched, matching the MinSync local
-retriever contract. Discovery reads the shared state root
+The default (`inl`) embedder is `Qwen/Qwen3-Embedding-0.6B` (1024-d) served by
+the central im-not-llm (`inl`) daemon on loopback. The in-process ONNX embedder
+(`--provider native`, WebGPU/Metal with CPU fallback) is opt-in and is a
+different vector space (cosine 0.90 to 0.96 to the daemon's on the same texts).
+Chunks are at most 2000 characters; a longer paragraph becomes sliding windows
+that overlap by 200 characters. Discovery reads the shared state root
 (`<cache-root>/serve/<instance>/{host,port}`), matches `GET /health` on
 `status: "ok"`, `kind` (dense when omitted), and `model_id`, and embeds via
-the daemon's OpenAI-compatible `POST {url}/v1/embeddings`. mailcrawl never
-starts a daemon; `--provider inl` requires one and fails with an `inl serve`
-hint otherwise. `auto` and `inl` persist the native identity because the
-daemon's vectors are interchangeable with the in-process ones, so starting
-the daemon does not force a rebuild. EmbeddingGemma remains as the
+the daemon's OpenAI-compatible `POST {url}/v1/embeddings`; a text the daemon
+refuses as over its context (HTTP 413) is split and embedded in halves.
+mailcrawl never starts a daemon and fails with an `inl serve` hint when none
+runs. The persisted identity is the vector space (`inl:Qwen/...:1024`), shared
+with a loopback `openai` endpoint on the same model (what AutoRAG injects), so
+a daemon restart on a new port or a run by hand versus by AutoRAG never forces
+a rebuild; `native` has its own. EmbeddingGemma remains as the
 `legacy-onnx` opt-in profile, and `loopback-http` stays an explicit opt-in
 override for shared gateways. The `tei` and `openai` providers (#43) speak
 the standard TEI `/embed` and OpenAI `/v1/embeddings` wire formats; their
