@@ -113,7 +113,7 @@ program
 program
   .command("index")
   .alias("embed")
-  .option("--provider <provider>", "embedding provider (auto, native, inl, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
+  .option("--provider <provider>", "embedding provider (inl, native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
   .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -150,7 +150,7 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
     .option("--after <date>")
     .option("--before <date>")
     .option("--limit <n>", "result limit", "10")
-    .option("--provider <provider>", "embedding provider (auto, native, inl, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
+    .option("--provider <provider>", "embedding provider (inl, native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
     .option("--model <model>", "native embedding model id")
     .option("--device <device>", "native device: auto, cpu, webgpu, metal")
     .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -192,7 +192,7 @@ program
   .option("--after <date>")
   .option("--before <date>")
   .option("--limit <n>", "result limit", "10")
-  .option("--provider <provider>", "embedding provider (auto, native, inl, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
+  .option("--provider <provider>", "embedding provider (inl, native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
   .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -309,7 +309,7 @@ program
   .option("--fts")
   .option("--semantic")
   .option("--all")
-  .option("--provider <provider>", "embedding provider (auto, native, inl, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
+  .option("--provider <provider>", "embedding provider (inl, native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
   .option("--dtype <dtype>", "native quantization: q4f16, q8, fp16, fp32, ...")
@@ -380,7 +380,7 @@ function filters(options: SearchOptions): SearchFilters {
 function embedderConfig(options: EmbedOptions): EmbedderConfig {
   if (process.env.MAILCRAWL_EMBEDDER === "mock") return { provider: "mock", batchSize: optionalCount(options.batchSize) };
   // "local" was the pre-#39 default; it names the same in-process path as "native".
-  const provider = options.provider === "local" ? "native" : options.provider ?? "auto";
+  const provider = options.provider === "local" ? "native" : options.provider ?? "inl";
   if (provider === "loopback-http" || provider === "tei" || provider === "openai") {
     const url = options.embedUrl ?? process.env.MAILCRAWL_EMBED_URL;
     const model = options.embedModel ?? process.env.MAILCRAWL_EMBED_MODEL;
@@ -414,11 +414,11 @@ function embedderConfig(options: EmbedOptions): EmbedderConfig {
       timeoutMs: timeout ? Number(timeout) : undefined,
     };
   }
-  if (provider !== "native" && provider !== "auto") throw new Error(`unsupported embedding provider: ${options.provider}`);
+  if (provider !== "native") throw new Error(`unsupported embedding provider: ${options.provider}`);
   const device = parseNativeDevice(options.device ?? process.env.MAILCRAWL_NATIVE_DEVICE ?? "auto");
   const dtype = parseNativeDtype(options.dtype ?? process.env.MAILCRAWL_NATIVE_DTYPE ?? "q4f16");
   return {
-    provider,
+    provider: "native",
     model,
     dimension: nativeModelProfile(model).dimension,
     device,

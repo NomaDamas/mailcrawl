@@ -25,20 +25,20 @@ For current Kiwi releases, use the complete model variant directory described
 in `docs/multilingual-installation.md`; do not mix model and WASM versions.
 
 Semantic indexing uses the `Qwen/Qwen3-Embedding-0.6B` (1024-d) profile:
-by default (`auto`) it embeds through a running im-not-llm (`inl`) daemon
-discovered over loopback under `$HOME/.cache/im-not-llm/serve`, and otherwise
-falls back to the same model in-process via ONNX Runtime's native binding
-(WebGPU/Metal on Apple Silicon, CPU fallback). Vectors are stored in a
-LanceDB table at `<data-dir>/semantic.lance`; the in-process fallback
-downloads the model to the local cache on first use. `--provider native`
-forces the in-process path, `--provider inl` requires a running daemon, and
-mailcrawl never starts one. `EmbeddingGemma` remains available as the
+by default (`inl`) it embeds through a running im-not-llm daemon discovered
+over loopback under `$HOME/.cache/im-not-llm/serve`; mailcrawl never starts
+one and fails with an `inl serve` hint when none runs. Vectors are stored in a
+LanceDB table at `<data-dir>/semantic.lance`. `--provider native` opts into the
+same model in-process via ONNX Runtime's native binding (WebGPU/Metal on Apple
+Silicon, CPU fallback; downloads the model on first use); its vectors differ
+from the daemon's, so switching rebuilds the index. `EmbeddingGemma` remains available as the
 `legacy-onnx` opt-in profile, and `loopback-http` stays an explicit override
 (#31); `tei` and `openai` (#43) talk to standard TEI / OpenAI-compatible
 servers. The embedder identity persisted at
 `<data-dir>/semantic.identity.json` governs reuse: a mismatch forces a full
-rebuild, never silent reuse. `auto` and `inl` persist the native identity, so
-starting the daemon does not force a rebuild.
+rebuild, never silent reuse. The identity is the vector space: `inl` and a
+loopback `openai` endpoint on the daemon's model share one, `native` has its
+own, and the query prefix is not part of it.
 
 Japanese and Chinese use the real Kagome and GSE analyzers from the discrawl
 multilingual design. Neither analyzer currently has a usable official Node

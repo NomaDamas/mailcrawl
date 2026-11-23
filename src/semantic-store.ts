@@ -59,15 +59,15 @@ export interface SemanticStore {
 }
 
 /**
- * Compares the identity fields that define the vector space. `runtimeBuild`
- * and `indexedRevision` are informational and deliberately excluded.
+ * Compares the identity fields that define the vector space: provider, model, dimension and the passage prefix,
+ * which is embedded into every stored vector. The query prefix only changes how a query is embedded, so a
+ * different one must not discard a built index. `runtimeBuild` and `indexedRevision` are informational.
  */
 export function sameEmbedder(left: EmbedderIdentity | undefined, right: EmbedderIdentity | undefined): boolean {
   if (!left || !right) return false;
   return left.provider === right.provider
     && left.model === right.model
     && left.dimension === right.dimension
-    && (left.queryPrefix ?? "") === (right.queryPrefix ?? "")
     && (left.passagePrefix ?? "") === (right.passagePrefix ?? "");
 }
 

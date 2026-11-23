@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createEmbedder, defaultAutoConfig, defaultNativeConfig, discoverInlDaemon, embedderIdentity } from "../src/embedding.js";
+import { createEmbedder, defaultInlConfig, defaultNativeConfig, discoverInlDaemon, embedderIdentity } from "../src/embedding.js";
 import { sameEmbedder } from "../src/semantic-store.js";
 
 const MODEL = "Qwen/Qwen3-Embedding-0.6B";
@@ -20,7 +20,7 @@ afterEach(async () => {
 interface RecordedRequest { url?: string; body: { model?: string; input?: string[] } }
 
 /** A fake inl daemon: answers `/health` with the given JSON and records `/v1/embeddings` posts. */
-async function fakeDaemon(health: Record<string, unknown>, bind = "127.0.0.1"): Promise<{ port: number; requests: RecordedRequest[] }> {
+async function fakeDaemon(health: Record<string, unknown>, bind = "127.0.0.1", maxChars?: number): Promise<{ port: number; requests: RecordedRequest[] }> {
   const requests: RecordedRequest[] = [];
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -32,6 +32,11 @@ async function fakeDaemon(health: Record<string, unknown>, bind = "127.0.0.1"): 
     }
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model?: string; input?: string[] };
     requests.push({ url: request.url, body });
+    if (maxChars !== undefined && (body.input ?? []).some((text) => text.length > maxChars)) {
+      response.statusCode = 413;
+      response.end(JSON.stringify({ error: { code: "context_length_exceeded", message: "maximum context length is 2048 tokens" } }));
+      return;
+    }
     const data = (body.input ?? []).map((_text, index) => ({ index, embedding: [index, index + 1] }));
     response.end(JSON.stringify({ object: "list", model: body.model, data }));
   });
@@ -177,13 +182,13 @@ describe("inl embedder", () => {
     }
   });
 
-  it("auto prefers the daemon when one answers", async () => {
+  it("the default provider embeds through the daemon when one answers", async () => {
     const home = tempDir("mailcrawl-inl-home-");
     try {
       await withHome(home, async () => {
         const daemon = await fakeDaemon({ status: "ok", kind: "dense", model_id: MODEL, dimension: 2 });
         stateDir(serveRootIn(home), "instance", "127.0.0.1", daemon.port);
-        const embedder = await createEmbedder(defaultAutoConfig());
+        const embedder = await createEmbedder(defaultInlConfig());
         await expect(embedder.embedQuery("q")).resolves.toEqual([0, 1]);
         expect(daemon.requests[0]).toMatchObject({ url: "/v1/embeddings", body: { model: MODEL, input: ["q"] } });
       });
@@ -192,14 +197,12 @@ describe("inl embedder", () => {
     }
   });
 
-  it("auto falls back to the in-process native embedder when no daemon answers", async () => {
+  it("the default provider fails with an inl serve hint when no daemon answers, and never falls back to ONNX", async () => {
     const home = tempDir("mailcrawl-inl-home-");
     try {
       await withHome(home, async () => {
         await expect(discoverInlDaemon({ model: MODEL })).resolves.toBeUndefined();
-        // Construction is lazy: the native ONNX model is only loaded on first
-        // embed, so this must resolve without a daemon or any network call.
-        await expect(createEmbedder(defaultAutoConfig())).resolves.toBeDefined();
+        await expect(createEmbedder(defaultInlConfig())).rejects.toThrow(/inl serve/);
       });
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -208,13 +211,64 @@ describe("inl embedder", () => {
 });
 
 describe("inl embedder identity", () => {
-  it("shares the native identity so starting the daemon never forces a re-embed", () => {
+  it("is the inl space for the default config and apart from the in-process ONNX embedder", () => {
     const native = embedderIdentity(defaultNativeConfig());
     const inl = embedderIdentity({ provider: "inl", model: MODEL });
-    const auto = embedderIdentity(defaultAutoConfig());
-    expect(inl).toMatchObject({ provider: "native", model: `native:${MODEL}`, dimension: 1024, runtimeBuild: "mailcrawl-inl-daemon" });
-    expect(sameEmbedder(inl, native)).toBe(true);
-    expect(sameEmbedder(auto, native)).toBe(true);
-    expect(sameEmbedder(inl, auto)).toBe(true);
+    expect(inl).toMatchObject({ provider: "inl", model: MODEL, dimension: 1024, runtimeBuild: "mailcrawl-inl-daemon" });
+    expect(sameEmbedder(inl, embedderIdentity(defaultInlConfig()))).toBe(true);
+    expect(sameEmbedder(inl, native)).toBe(false);
+  });
+});
+
+describe("inl embedder over-context inputs", () => {
+  it("splits a rejected document, embeds the halves and returns one unit vector for it", async () => {
+    const home = tempDir("mailcrawl-inl-home-");
+    try {
+      await withHome(home, async () => {
+        const daemon = await fakeDaemon({ status: "ok", kind: "dense", model_id: MODEL, dimension: 2 }, "127.0.0.1", 100);
+        stateDir(serveRootIn(home), "instance", "127.0.0.1", daemon.port);
+        const embedder = await createEmbedder({ provider: "inl", model: MODEL });
+        const long = `${"가나다라 ".repeat(60)}`; // 300 chars, over the 100-char fake limit
+        const vectors = await embedder.embedDocuments(["short", long]);
+        expect(vectors).toHaveLength(2);
+        expect(vectors[1]).toHaveLength(2);
+        expect(Math.hypot(...vectors[1]!)).toBeCloseTo(1, 6);
+        // Nothing sent to the daemon was over its limit once the rejection was handled.
+        const accepted = daemon.requests.filter((request) => (request.body.input ?? []).every((text) => text.length <= 100));
+        expect(accepted.length).toBeGreaterThan(0);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not split anything the daemon accepts", async () => {
+    const home = tempDir("mailcrawl-inl-home-");
+    try {
+      await withHome(home, async () => {
+        const daemon = await fakeDaemon({ status: "ok", kind: "dense", model_id: MODEL, dimension: 2 }, "127.0.0.1", 1000);
+        stateDir(serveRootIn(home), "instance", "127.0.0.1", daemon.port);
+        const embedder = await createEmbedder({ provider: "inl", model: MODEL });
+        await embedder.embedDocuments(["a", "b"]);
+        expect(daemon.requests).toHaveLength(1);
+        expect(daemon.requests[0]!.body.input).toEqual(["a", "b"]);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("fails clearly when a single character is still rejected", async () => {
+    const home = tempDir("mailcrawl-inl-home-");
+    try {
+      await withHome(home, async () => {
+        const daemon = await fakeDaemon({ status: "ok", kind: "dense", model_id: MODEL, dimension: 2 }, "127.0.0.1", 0);
+        stateDir(serveRootIn(home), "instance", "127.0.0.1", daemon.port);
+        const embedder = await createEmbedder({ provider: "inl", model: MODEL });
+        await expect(embedder.embedDocuments(["x"])).rejects.toThrow(/413/);
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

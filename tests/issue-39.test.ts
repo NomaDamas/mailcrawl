@@ -118,11 +118,13 @@ describe("issue #39: native embedder defaults and identity", () => {
     expect(embeddingBatchSize({ provider: "mock" })).toBe(32);
   });
 
-  it("treats identity as data: provider, model, dimension, and prefixes define equality", () => {
+  it("treats identity as data: provider, model, dimension and passage prefix define equality; a query prefix does not", () => {
     const base: EmbedderIdentity = { provider: "native", model: "native:Qwen/Qwen3-Embedding-0.6B", dimension: 1024, runtimeBuild: "a" };
     expect(sameEmbedder(base, { ...base, runtimeBuild: "different" })).toBe(true);
     expect(sameEmbedder(base, { ...base, dimension: 768 })).toBe(false);
-    expect(sameEmbedder(base, { ...base, queryPrefix: "q: " })).toBe(false);
+    expect(sameEmbedder(base, { ...base, passagePrefix: "p: " })).toBe(false);
+    // A query prefix changes how a query is embedded, not any stored vector.
+    expect(sameEmbedder(base, { ...base, queryPrefix: "q: " })).toBe(true);
     expect(sameEmbedder(base, undefined)).toBe(false);
   });
 });
