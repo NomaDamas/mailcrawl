@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Chunk, EmbedderConfig, EmbedderIdentity, FilesSnapshot, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SourceFileState, SyncOptions, SyncReport } from "./types.js";
+import type { Chunk, EmbedderConfig, EmbedderIdentity, FilesSnapshot, GrepHit, GrepOptions, MailMessage, NormalizedMessage, SearchFilters, SearchHit, SourceFileState, SyncOptions, SyncReport } from "./types.js";
 import { buildChunks } from "./chunk.js";
 import { normalizeMessage } from "./normalize.js";
 import { scopedId, snippet } from "./util.js";
@@ -541,6 +541,115 @@ export class Archive {
       .map(({ hit, score }) => ({ ...hit, score }));
   }
 
+  /**
+   * Exact substring or regex grep over parsed email chunks (subject, latest body, quoted body,
+   * and extracted attachment text) with zero tokenization or model invocation.
+   */
+  grep(pattern: string, options: GrepOptions = {}): GrepHit[] {
+    if (!pattern) throw new Error("empty grep pattern");
+    const flags = options.ignoreCase ? "i" : "";
+    let matcher: RegExp;
+    try {
+      const source = options.literal ? pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : pattern;
+      matcher = new RegExp(source, flags);
+    } catch (error) {
+      throw new Error(`invalid grep pattern: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    const limit = Math.max(1, Math.floor(options.limit ?? 50));
+    const maxPerMessage = Math.max(1, Math.floor(options.maxPerMessage ?? 10));
+    const context = Math.min(20, Math.max(0, Math.floor(options.context ?? 0)));
+    const filters = options.filters ?? {};
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    addFilters(clauses, params, filters);
+
+    // Push a coarse SQLite LIKE prefilter for literal patterns to avoid full JS scan of non-matching rows.
+    if (options.literal) {
+      const escaped = pattern.replace(/[\\%_]/g, "\\$&");
+      const likePattern = `%${escaped}%`;
+      clauses.push("(c.text LIKE ? ESCAPE '\\' OR m.subject LIKE ? ESCAPE '\\' OR m.from_address LIKE ? ESCAPE '\\')");
+      params.push(likePattern, likePattern, likePattern);
+    }
+
+    const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const sql = `SELECT c.chunk_id, c.message_id, c.thread_id, c.account_id, c.mailbox, c.section,
+      m.subject, m.from_address, m.to_addresses, m.date, c.text
+      FROM chunks c JOIN messages m ON m.message_id = c.message_id
+      ${whereClause}
+      ORDER BY m.date DESC, c.message_id ASC, c.ordinal ASC`;
+
+    const hits: GrepHit[] = [];
+    const perMessage = new Map<string, number>();
+    const subjectMatched = new Set<string>();
+
+    for (const row of this.db.prepare(sql).iterate(...params) as Iterable<GrepRow>) {
+      const existingCount = perMessage.get(row.message_id) ?? 0;
+      if (existingCount >= maxPerMessage) continue;
+      let countForMsg = existingCount;
+      const toList = JSON.parse(row.to_addresses) as string[];
+
+      // Match subject at most once per message.
+      if (!subjectMatched.has(row.message_id) && matcher.test(row.subject)) {
+        subjectMatched.add(row.message_id);
+        countForMsg += 1;
+        perMessage.set(row.message_id, countForMsg);
+        hits.push({
+          chunkId: row.chunk_id,
+          messageId: row.message_id,
+          threadId: row.thread_id,
+          accountId: row.account_id,
+          mailbox: row.mailbox,
+          subject: row.subject,
+          from: row.from_address,
+          to: toList,
+          date: row.date,
+          section: "subject",
+          lineNumber: 1,
+          lineEnd: 1,
+          line: row.subject,
+          snippet: `Subject: ${row.subject}`,
+          score: 1 / (hits.length + 1),
+          mode: "grep",
+        });
+        if (hits.length >= limit) break;
+        if (countForMsg >= maxPerMessage) continue;
+      }
+
+      const lines = row.text.split(/\r?\n/);
+      for (let idx = 0; idx < lines.length; idx += 1) {
+        const line = lines[idx] ?? "";
+        if (!matcher.test(line)) continue;
+        countForMsg += 1;
+        perMessage.set(row.message_id, countForMsg);
+        const startIdx = Math.max(0, idx - context);
+        const endIdx = Math.min(lines.length - 1, idx + context);
+        hits.push({
+          chunkId: row.chunk_id,
+          messageId: row.message_id,
+          threadId: row.thread_id,
+          accountId: row.account_id,
+          mailbox: row.mailbox,
+          subject: row.subject,
+          from: row.from_address,
+          to: toList,
+          date: row.date,
+          section: row.section,
+          lineNumber: idx + 1,
+          lineEnd: endIdx + 1,
+          line,
+          snippet: lines.slice(startIdx, endIdx + 1).join("\n"),
+          score: 1 / (hits.length + 1),
+          mode: "grep",
+        });
+        if (hits.length >= limit || countForMsg >= maxPerMessage) break;
+      }
+      if (hits.length >= limit) break;
+    }
+
+    return hits;
+  }
+
   getMessage(messageId: string): NormalizedMessage | undefined {
     const row = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(messageId) as MessageRow | undefined;
     return row && messageRow(row);
@@ -882,6 +991,7 @@ function countExcluded(messages: NormalizedMessage[], excluded: Set<string>): Re
 
 type SearchRow = { chunk_id: string; message_id: string; thread_id: string; account_id: string; mailbox: string; subject: string; from_address: string; to_addresses: string; date: string; snippet: string; score: number };
 type SemanticRow = Omit<SearchRow, "snippet" | "score"> & { text: string };
+type GrepRow = SemanticRow & { section: string };
 type ChunkPageRow = { chunk_id: string; text: string; content_hash: string; account_id: string; mailbox: string; thread_id: string; message_id: string; date: string; from_address: string };
 type AttachmentRow = {
   attachment_id: string;

@@ -183,7 +183,7 @@ for (const mode of ["bm25", "keyword", "semantic", "hybrid"] as const) {
 program
   .command("search")
   .argument("<query>")
-  .option("--mode <mode>", "fts, keyword, bm25, semantic, hybrid", "bm25")
+  .option("--mode <mode>", "fts, keyword, bm25, semantic, hybrid, grep", "bm25")
   .option("--account <id>")
   .option("--mailbox <name>")
   .option("--from <address>")
@@ -192,6 +192,9 @@ program
   .option("--after <date>")
   .option("--before <date>")
   .option("--limit <n>", "result limit", "10")
+  .option("-i, --ignore-case", "case-insensitive grep match")
+  .option("-F, --literal", "treat grep pattern as a literal string")
+  .option("-C, --context <n>", "lines of context around each grep match", "0")
   .option("--provider <provider>", "embedding provider (inl, native, legacy-onnx, loopback-http, tei, openai)", process.env.MAILCRAWL_EMBEDDER_PROVIDER)
   .option("--model <model>", "native embedding model id")
   .option("--device <device>", "native device: auto, cpu, webgpu, metal")
@@ -206,7 +209,7 @@ program
   .option("--embed-api-key-env <name>", "environment variable holding the API key (tei, openai)")
   .option("--embed-allow-remote", "allow a non-loopback https embedding endpoint (tei, openai)")
   .option("--json")
-  .action(async (query: string, options: SearchOptions & { mode: string }, command: Command) => {
+  .action(async (query: string, options: SearchOptions & { mode: string; ignoreCase?: boolean; literal?: boolean; context?: string }, command: Command) => {
     const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"), embedderConfig(options));
     try {
       const filter = filters(options);
@@ -214,7 +217,46 @@ program
       const result = options.mode === "bm25" || options.mode === "fts" || options.mode === "keyword" ? await archive.searchBm25(query, filter, limit)
         : options.mode === "semantic" ? await archive.searchSemantic(query, filter, limit)
           : options.mode === "hybrid" ? await archive.searchHybrid(query, filter, limit)
-            : (() => { throw new Error(`unsupported search mode: ${options.mode}`); })();
+            : options.mode === "grep" ? archive.grep(query, {
+                literal: options.literal === true,
+                ignoreCase: options.ignoreCase === true,
+                context: options.context ? Number(options.context) : 0,
+                limit,
+                filters: filter,
+              })
+              : (() => { throw new Error(`unsupported search mode: ${options.mode}`); })();
+      output(result, options.json);
+    } finally { archive.close(); }
+  });
+
+program
+  .command("grep")
+  .description("Exact literal or regex match over parsed archived emails (no embeddings/FTS tokenization)")
+  .argument("<pattern>")
+  .option("-F, --literal", "treat pattern as a literal string instead of regex")
+  .option("-i, --ignore-case", "case-insensitive match")
+  .option("-C, --context <n>", "lines of context before and after each match", "0")
+  .option("--max-per-message <n>", "maximum matches kept per email", "10")
+  .option("--account <id>")
+  .option("--mailbox <name>")
+  .option("--from <address>")
+  .option("--to <address>")
+  .option("--thread <id>")
+  .option("--after <date>")
+  .option("--before <date>")
+  .option("--limit <n>", "result limit", "50")
+  .option("--json")
+  .action(async (pattern: string, options: GrepCliOptions, command: Command) => {
+    const archive = new Archive(join(command.parent!.opts().dataDir, "archive.sqlite"));
+    try {
+      const result = archive.grep(pattern, {
+        literal: options.literal === true,
+        ignoreCase: options.ignoreCase === true,
+        context: Number(options.context),
+        maxPerMessage: Number(options.maxPerMessage),
+        limit: Number(options.limit),
+        filters: filters(options),
+      });
       output(result, options.json);
     } finally { archive.close(); }
   });
@@ -373,8 +415,10 @@ interface EmbedOptions extends JsonOptions {
   embedApiKeyEnv?: string;
 }
 interface SyncOptions extends JsonOptions { source: string; fixture?: string; path: string[]; account?: string; mailbox?: string; backend?: string; pageSize: string; concurrency?: string; readTimeout?: string; himalayaConfig?: string; includeCategory: string[]; excludeCategory: string[] }
-interface SearchOptions extends EmbedOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
-function filters(options: SearchOptions): SearchFilters {
+interface FilterCliOptions extends JsonOptions { account?: string; mailbox?: string; from?: string; to?: string; thread?: string; after?: string; before?: string; limit: string }
+interface SearchOptions extends EmbedOptions, FilterCliOptions {}
+interface GrepCliOptions extends FilterCliOptions { literal?: boolean; ignoreCase?: boolean; context: string; maxPerMessage: string }
+function filters(options: FilterCliOptions): SearchFilters {
   return { accountId: options.account, mailbox: options.mailbox, from: options.from, to: options.to, threadId: options.thread, after: options.after, before: options.before };
 }
 function embedderConfig(options: EmbedOptions): EmbedderConfig {

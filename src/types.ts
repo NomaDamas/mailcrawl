@@ -1,4 +1,4 @@
-export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid";
+export type SearchMode = "keyword" | "bm25" | "semantic" | "hybrid" | "grep";
 
 export type EmbedderProvider = "native" | "inl" | "legacy-onnx" | "loopback-http" | "tei" | "openai" | "mock";
 
@@ -179,6 +179,23 @@ export interface SearchHit {
   snippet: string;
   score: number;
   mode: SearchMode;
+}
+
+export interface GrepOptions {
+  literal?: boolean;
+  ignoreCase?: boolean;
+  context?: number;
+  limit?: number;
+  maxPerMessage?: number;
+  filters?: SearchFilters;
+}
+
+export interface GrepHit extends SearchHit {
+  mode: "grep";
+  section: string;
+  lineNumber: number;
+  lineEnd: number;
+  line: string;
 }
 
 export type LexicalLanguage = "ko" | "ja" | "zh" | "ar";
